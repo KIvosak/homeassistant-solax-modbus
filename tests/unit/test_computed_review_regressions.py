@@ -143,7 +143,7 @@ async def test_communication_diagnostics_remain_available_during_slowdown(public
 
 
 @pytest.mark.asyncio
-async def test_integral_publishes_unavailable_without_losing_restore_total(publication_hass: HomeAssistant) -> None:
+async def test_integral_publishes_unavailable_without_losing_restore_total(publication_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
     from .test_riemann_readiness import make_integral, observe
 
     entity, hub = make_integral()
@@ -151,7 +151,8 @@ async def test_integral_publishes_unavailable_without_losing_restore_total(publi
     entity.entity_id = "sensor.integral_readiness"
     # Use real HA publication instead of the arithmetic-only fixture's mock.
     del entity.async_write_ha_state
-    clock = [time.monotonic()]
+    clock = [1000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     with patch("custom_components.solax_modbus.sensor.async_call_later") as later:
         observe(hub, clock, 3600)
         entity.modbus_data_updated()
