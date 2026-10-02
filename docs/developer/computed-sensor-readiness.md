@@ -78,6 +78,13 @@ cancelled on entity removal. Its limit is three times the slowest configured
 raw dependency interval (the default interval for local/no-input descriptions),
 not the communication-failure slowdown interval.
 
+The three communication diagnostics are an explicit exception: they describe
+the local poll outcome, not a measured input. The hub publishes them after
+recording each completed poll, outside the computed evaluator and its expiry
+timer. They therefore remain available during slowdown/polling silence rather
+than hiding `Degraded` or `Offline`. This exception does not disable expiry for
+other time-dependent or dependency-free computed sensors.
+
 Cross-interval input reuse is deliberately narrower than arbitrary cache use:
 only raw registered dependencies qualify; a missing same-interval input or
 failed computed intermediate still blocks the calculation. At least one
@@ -92,6 +99,37 @@ Dependencies not present in the active inverter's description set or data are
 ignored. This lets one description cover model variants while still requiring
 every input that is applicable to the detected inverter.
 
+## Riemann energy integrals
+
+Riemann energy sensors consume completed, accepted source-hub snapshots rather
+than `hub.data` or a cached dashboard mirror. Their callbacks run after the
+interval snapshot is published, including failed and discarded intervals.
+They validate finite numeric power before and after filtering; zero remains
+valid, while booleans and numeric strings are not power measurements.
+
+Integration uses the monotonic observation time of the selected source, not
+callback time. Duplicate callbacks or overlays from unrelated scan intervals
+cannot re-date a sample, accumulate energy or renew its availability lease.
+A newer invalid source interval cannot fall back to an older computed result
+from another interval. Source selection and age limits use the actual source
+hub, including slave PV variants and parallel-mode mappings.
+
+Invalid/missing/stale power makes the integral unavailable while preserving its
+total and breaking the integration interval. The first valid sample after a gap
+only establishes a new baseline; the next valid sample resumes integration.
+An expiry timer handles complete polling silence, and a sample-time gap check
+also protects against delayed timer delivery. Source hub/key changes and
+dashboard reactivation likewise break the interval. Missing energy is not
+estimated or backfilled: the integral is incomplete across the outage.
+
+The accumulated total and its local reset date are saved through HA's
+`RestoreEntity.extra_restore_state_data`, independently of visible availability.
+HA omits ordinary extra attributes when an entity is unavailable, so those
+attributes alone cannot preserve the total through a restart during an outage.
+Legacy numeric restored states remain supported. Cold startup without a saved
+total stays unknown until a valid power sample; restart never integrates its
+downtime, and the existing local-midnight reset remains in effect.
+
 ## Contributor checks
 
 When adding or changing a computed sensor:
@@ -104,3 +142,6 @@ When adding or changing a computed sensor:
    polling where relevant.
 4. Keep direct sensor `value_function` calls out of the entity platform. The
    structural tests enforce both the explicit contract and shared startup path.
+5. For energy integrals, test missing data, no-callback expiry, source-hub
+   selection, duplicate callbacks and restart while unavailable. Assert both
+   HA publication and preserved restore data, not just internal arithmetic.
