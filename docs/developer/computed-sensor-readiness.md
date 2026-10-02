@@ -14,12 +14,12 @@ All register-less computed sensors are evaluated by
 - accepts numeric zero and boolean false as valid inputs;
 - rejects missing, `None`, NaN and infinite required inputs;
 - preserves the last coherent value briefly when inputs/results are invalid;
-- expires the entity's availability after three configured input intervals
-  without an accepted computation, including complete polling silence;
-- requires every mandatory input in the current interval to be fresh;
-  dependencies may span device groups in that refresh;
-- permits raw inputs from a different interval only from that interval's latest
-  accepted snapshot, at most three of its configured intervals old;
+- expires each measured input after three of its own configured intervals,
+  including complete polling silence;
+- requires every mandatory input to have an accepted, unexpired observation;
+  dependencies may span device groups and independently configured intervals;
+- permits bounded reuse of both raw inputs and computed intermediates, without
+  treating the reuse as a new source observation;
 - prevents a stale computed intermediate from releasing a downstream calculation;
 - resolves computed-on-computed chains in dependency order.
 
@@ -70,8 +70,8 @@ documented base calculation, not zero-filled partial correction terms.
 
 ## Age and interval boundaries
 
-The availability timer is renewed by publication of an accepted calculation,
-not by an attempted poll. Invalid or discarded groups cannot renew it. Expiry
+The availability timer uses the absolute deadline inherited from accepted
+inputs, not the time of publication. Invalid or discarded groups cannot renew it. Expiry
 preserves the last numeric value internally but exposes `unavailable`; a later
 accepted zero or nonzero measurement restores availability. The timer is
 cancelled on entity removal. Its limit is three times the slowest configured
@@ -85,15 +85,25 @@ timer. They therefore remain available during slowdown/polling silence rather
 than hiding `Degraded` or `Offline`. This exception does not disable expiry for
 other time-dependent or dependency-free computed sensors.
 
-Cross-interval input reuse is deliberately narrower than arbitrary cache use:
-only raw registered dependencies qualify; a missing same-interval input or
-failed computed intermediate still blocks the calculation. At least one
-declared input must be freshly observed for an ordinary calculation. The
-latest completed snapshot replaces the previous snapshot even on partial or
-discarded reads, and rebuilding polling blocks clears all snapshots. Inputs
+Per-key observations distinguish a key not read by a device group from an
+attempted but failed, rejected or invalid read. A computed result inherits the
+earliest deadline of the accepted inputs used in its calculation; required
+dependencies are also checked individually on reuse. A slow input cannot keep
+an expired fast input valid. At least one declared input must be freshly
+observed for an ordinary calculation. Reading an unchanged numeric value is a
+new observation; reading another group is not. Staged observations become
+visible to other hubs only after group validation. Rebuilding polling blocks
+clears all snapshots and observation records. Inputs
 from independently scheduled groups/hubs are bounded in age, not simultaneous
 physical measurements. No data dictionary or freshness set is modified by the
 input overlay. `force=True` is not used to accept cross-hub cache data.
+
+For Energy Dashboard mappings, validate topology before selecting Free/Master/
+Slave input. Topology changes switch the source; unchanged topology may reuse
+an accepted computed power without changing its timestamp or deadline. Every
+contributing hub must supply valid data. `None` publishes HA `unknown`, while
+expiry publishes `unavailable`; repeated unknown publications do not extend the
+last valid lease. Mapping/filter functions and entity IDs remain unchanged.
 
 Dependencies not present in the active inverter's description set or data are
 ignored. This lets one description cover model variants while still requiring
@@ -121,6 +131,10 @@ An expiry timer handles complete polling silence, and a sample-time gap check
 also protects against delayed timer delivery. Source hub/key changes and
 dashboard reactivation likewise break the interval. Missing energy is not
 estimated or backfilled: the integral is incomplete across the outage.
+
+Integral expiry and the gap check use the selected source's inherited absolute
+deadline, so a mixed-interval computed power cannot bridge expiry of its faster
+required input while a slower dependency remains valid.
 
 The accumulated total and its local reset date are saved through HA's
 `RestoreEntity.extra_restore_state_data`, independently of visible availability.
