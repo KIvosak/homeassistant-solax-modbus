@@ -83,9 +83,11 @@ def setup_poll(fast: int = 5, slow: int = 15) -> tuple[Any, Any, Any, Any]:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("fast", "slow"), [(5, 15), (7, 23), (15, 5)])
-async def test_tcworld_sequence_keeps_computed_power_between_groups(fast: int, slow: int, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_tcworld_sequence_keeps_computed_power_between_groups(
+    fast: int, slow: int, monkeypatch: pytest.MonkeyPatch, clock_start: float
+) -> None:
     hub, ed, power, settings = setup_poll(fast, slow)
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -140,13 +142,13 @@ async def test_fast_refresh_interleaves_between_slow_device_groups() -> None:
 
 
 @pytest.mark.asyncio
-async def test_topology_poll_does_not_renew_power_lease(interval_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_topology_poll_does_not_renew_power_lease(interval_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, clock_start: float) -> None:
     hub, ed, power, settings = setup_poll()
     entity = SolaXModbusSensor("test", hub, DeviceInfo(identifiers={(DOMAIN, "ed")}), ed)
     entity.hass = interval_hass
     entity.entity_id = "sensor.mixed_interval_power"
     await entity.async_added_to_hass()
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)
@@ -157,7 +159,7 @@ async def test_topology_poll_does_not_renew_power_lease(interval_hass: HomeAssis
     clock[0] += 10
     await hub._refresh_interval_group_once(settings)
     assert interval_hass.states.is_state(entity.entity_id, "191")
-    assert later.call_args.args[1] <= 5.01
+    assert later.call_args.args[1] == pytest.approx(5.0, rel=0, abs=1e-9)
     clock[0] += 6
     later.call_args.args[2](None)
     assert interval_hass.states.is_state(entity.entity_id, "unavailable")
@@ -165,13 +167,13 @@ async def test_topology_poll_does_not_renew_power_lease(interval_hass: HomeAssis
 
 
 @pytest.mark.asyncio
-async def test_required_dependencies_expire_individually(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_required_dependencies_expire_individually(monkeypatch: pytest.MonkeyPatch, clock_start: float) -> None:
     hub, ed, power, settings = setup_poll()
     # The computed source actually uses one slow and one fast required input.
     hub.sensorDescriptions["measured_power"] = replace(hub.sensorDescriptions["measured_power"], scan_group="scan_interval")
     power.device_groups["power"].holdingBlocks[0].descriptions = {0: hub.sensorDescriptions["inverter_power"]}
     settings.device_groups["settings"].holdingBlocks[0].descriptions[1] = hub.sensorDescriptions["measured_power"]
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -257,9 +259,9 @@ async def test_topology_changes_select_only_current_mapping() -> None:
 
 
 @pytest.mark.asyncio
-async def test_identical_power_is_a_new_observation_but_topology_is_not(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_identical_power_is_a_new_observation_but_topology_is_not(monkeypatch: pytest.MonkeyPatch, clock_start: float) -> None:
     hub, ed, power, settings = setup_poll()
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -276,13 +278,15 @@ async def test_identical_power_is_a_new_observation_but_topology_is_not(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_invalid_input_publishes_unknown_then_expires(interval_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_invalid_input_publishes_unknown_then_expires(
+    interval_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, clock_start: float
+) -> None:
     hub, ed, power, settings = setup_poll()
     entity = SolaXModbusSensor("test", hub, DeviceInfo(identifiers={(DOMAIN, "ed")}), ed)
     entity.hass = interval_hass
     entity.entity_id = "sensor.invalid_input_power"
     await entity.async_added_to_hass()
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)
@@ -300,7 +304,7 @@ async def test_invalid_input_publishes_unknown_then_expires(interval_hass: HomeA
     await hub._refresh_interval_group_once(power)
     assert interval_hass.states.is_state(entity.entity_id, "unknown")
     assert entity.available
-    assert later.call_args.args[1] == 10
+    assert later.call_args.args[1] == pytest.approx(10.0, rel=0, abs=1e-9)
     clock[0] += 11
     later.call_args.args[2](None)
     assert interval_hass.states.is_state(entity.entity_id, "unavailable")
@@ -311,13 +315,13 @@ async def test_invalid_input_publishes_unknown_then_expires(interval_hass: HomeA
 
 
 @pytest.mark.asyncio
-async def test_dashboard_also_expires_a_faster_topology_input(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_dashboard_also_expires_a_faster_topology_input(monkeypatch: pytest.MonkeyPatch, clock_start: float) -> None:
     hub, ed, power, settings = setup_poll(15, 5)
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
-    assert hub.computed_sensor_remaining_age(ed) == 15
+    assert hub.computed_sensor_remaining_age(ed) == pytest.approx(15.0, rel=0, abs=1e-9)
     clock[0] += 16
     await hub._refresh_interval_group_once(power)
     assert hub.data[ed.key] is None
@@ -407,7 +411,7 @@ async def test_computed_zero_is_not_missing_data() -> None:
 
 
 @pytest.mark.asyncio
-async def test_integral_uses_shortest_required_input_lease_and_breaks_silent_gap(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_integral_uses_shortest_required_input_lease_and_breaks_silent_gap(monkeypatch: pytest.MonkeyPatch, clock_start: float) -> None:
     hub, _ed, power, settings = setup_poll()
     config, source_description = hub.config, hub.sensorDescriptions["house_load"]
     integral, _source = make_integral(source_hub=hub, source_key="house_load")
@@ -416,7 +420,7 @@ async def test_integral_uses_shortest_required_input_lease_and_breaks_silent_gap
     hub.sensorDescriptions["measured_power"] = replace(hub.sensorDescriptions["measured_power"], scan_group="scan_interval")
     power.device_groups["power"].holdingBlocks[0].descriptions = {0: hub.sensorDescriptions["inverter_power"]}
     settings.device_groups["settings"].holdingBlocks[0].descriptions[1] = hub.sensorDescriptions["measured_power"]
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)
@@ -426,7 +430,7 @@ async def test_integral_uses_shortest_required_input_lease_and_breaks_silent_gap
     assert hub._accepted_input_sample("house_load") is not None
     assert hub._dashboard_source_sample(integral._riemann_mapping, {}, set(), require_source_sample=True) is not None
     integral.modbus_data_updated()
-    assert later.call_args.args[1] == 15
+    assert later.call_args.args[1] == pytest.approx(15.0, rel=0, abs=1e-9)
     clock[0] += 5
     await hub._refresh_interval_group_once(power)
     integral.modbus_data_updated()

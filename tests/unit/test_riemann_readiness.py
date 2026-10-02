@@ -18,10 +18,9 @@ from .test_poll_snapshot import make_group, make_hub, successful_block
 
 
 @pytest.fixture
-def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+def clock(monkeypatch: pytest.MonkeyPatch, clock_start: float) -> list[float]:
     """Control sample/expiry time without sleeping or accessing a device."""
-    # Use an exact origin instead of inheriting host uptime and float spacing.
-    now = [1000.0]
+    now = [clock_start]
     monkeypatch.setattr("custom_components.solax_modbus.sensor.time.monotonic", lambda: now[0])
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", Mock())
     return now
@@ -113,7 +112,7 @@ def test_expiry_without_callbacks_breaks_gap_and_keeps_total(clock: list[float],
     entity, hub = make_integral()
     observe(hub, clock, 3600)
     entity.modbus_data_updated()
-    assert later.call_args.args[1] == 45
+    assert later.call_args.args[1] == pytest.approx(45.0, rel=0, abs=1e-9)
     clock[0] += 46
     later.call_args.args[2](None)
     assert not entity.available
@@ -137,17 +136,17 @@ def test_long_gap_is_not_bridged_even_before_delayed_expiry_callback(clock: list
 def test_valid_zero_and_filter_are_not_missing_data(clock: list[float]) -> None:
     entity, hub = make_integral()
     entity._filter_function = lambda value: max(0, -value)
-    observe(hub, clock, -3600)
+    observe(hub, clock, -7200)
     entity.modbus_data_updated()
     clock[0] += 15
     observe(hub, clock, 0)
     entity.modbus_data_updated()
     assert entity.available
-    assert entity.native_value == 0.007
+    assert entity.native_value == 0.015
     clock[0] += 15
     observe(hub, clock, 1000)
     entity.modbus_data_updated()
-    assert entity.native_value == 0.007
+    assert entity.native_value == 0.015
 
 
 @pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), True])
@@ -179,13 +178,14 @@ def test_slave_integral_uses_slave_snapshot_not_master_cached_mirror(clock: list
 
 def test_unrelated_interval_cannot_redate_overlaid_power(clock: list[float]) -> None:
     entity, hub = make_integral()
+    first_sample = clock[0]
     observe(hub, clock, 3600)
     entity.modbus_data_updated()
     clock[0] += 10
     hub._computed_source_snapshots[5] = (clock[0], hub.data.copy(), {"other"})
     entity.modbus_data_updated()
     assert entity.native_value == 0
-    assert entity._last_update_time == clock[0] - 10
+    assert entity._last_update_time == first_sample
 
 
 @pytest.mark.parametrize("fresh", [set(), {"power"}])
@@ -346,15 +346,14 @@ def test_source_interval_controls_expiry(clock: list[float], monkeypatch: pytest
     hub.sensorDescriptions["power"] = replace(hub.sensorDescriptions["power"], register=1)
     observe(hub, clock, 3600)
     entity.modbus_data_updated()
-    assert later.call_args.args[1] == 90
+    assert later.call_args.args[1] == pytest.approx(90.0, rel=0, abs=1e-9)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["unknown", "unavailable"])
-@pytest.mark.parametrize("start", [1000.0, 1.1, 1.4, 113.2])
-async def test_restart_during_outage_restores_saved_total(clock: list[float], state: str, start: float) -> None:
+@pytest.mark.parametrize("clock_start", [1000.0, 1.1, 1.4, 113.2])
+async def test_restart_during_outage_restores_saved_total(clock: list[float], state: str) -> None:
     # Fractional clock origins expose subtraction rounding on either platform.
-    clock[0] = start
     entity, hub = make_integral()
     observe(hub, clock, 3600)
     entity.modbus_data_updated()
@@ -372,7 +371,7 @@ async def test_restart_during_outage_restores_saved_total(clock: list[float], st
     restored_hub._name = None
     await restored.async_added_to_hass()
     assert restored.extra_restore_state_data.as_dict()["energy"] == saved_energy
-    assert restored.native_value == saved_energy
+    assert restored.native_value == 0.015
     clock[0] += 600
     observe(restored_hub, clock, 3600)
     restored.modbus_data_updated()
@@ -393,6 +392,27 @@ async def test_invalid_restored_total_starts_unknown(clock: list[float], bad: An
     observe(hub, clock, 0)
     entity.modbus_data_updated()
     assert entity.native_value == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("saved_energy", "published_energy"), [(0.015000000000000003, 0.015), (12.3456789, 12.346), (0.0, 0.0)])
+async def test_restored_total_is_rounded_for_publication_only(clock: list[float], saved_energy: float, published_energy: float) -> None:
+    entity, hub = make_integral()
+    entity.async_get_last_state = AsyncMock(return_value=SimpleNamespace(state="unavailable", attributes={}))
+    entity.async_get_last_extra_data = AsyncMock(return_value=SimpleNamespace(as_dict=lambda: {"energy": saved_energy}))
+    hub.async_add_solax_modbus_sensor = AsyncMock()
+    hub._name = None
+    await entity.async_added_to_hass()
+    assert "energy" not in hub.data  # Exercise the restored-value fallback.
+    assert entity.native_value == published_energy
+    assert entity._total_energy == saved_energy
+    assert entity.extra_restore_state_data.as_dict()["energy"] == saved_energy
+    clock[0] += 600
+    observe(hub, clock, 3600)
+    entity.modbus_data_updated()
+    assert entity.native_value == published_energy
+    assert entity._total_energy == saved_energy
+    assert entity.extra_restore_state_data.as_dict()["energy"] == saved_energy
 
 
 def test_switching_source_hubs_does_not_bridge_same_named_inputs(clock: list[float]) -> None:

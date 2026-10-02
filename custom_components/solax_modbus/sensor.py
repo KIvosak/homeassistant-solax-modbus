@@ -819,11 +819,13 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
     @property
     def native_value(self) -> float | None:
         """Return the calculated energy value."""
+        from .energy_dashboard import RIEMANN_ROUND_DIGITS
+
         # Value is stored in hub.data by modbus_data_updated
         if self.entity_description.key in self._hub.data:
             value = self._hub.data[self.entity_description.key]
             return float(value) if value is not None else None
-        return self._total_energy if self._has_valid_total else None
+        return round(self._total_energy, RIEMANN_ROUND_DIGITS) if self._has_valid_total else None
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:

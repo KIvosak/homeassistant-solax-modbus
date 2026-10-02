@@ -143,6 +143,9 @@ attributes alone cannot preserve the total through a restart during an outage.
 Legacy numeric restored states remain supported. Cold startup without a saved
 total stays unknown until a valid power sample; restart never integrates its
 downtime, and the existing local-midnight reset remains in effect.
+The accumulator and extra restore data keep the unrounded total. Published
+energy uses three decimal places, including the restored-value fallback before
+the first accepted power sample. Publication never rounds the stored total.
 
 ## Contributor checks
 
@@ -159,3 +162,6 @@ When adding or changing a computed sensor:
 5. For energy integrals, test missing data, no-callback expiry, source-hub
    selection, duplicate callbacks and restart while unavailable. Assert both
    HA publication and preserved restore data, not just internal arithmetic.
+   Use controlled integer and fractional clock origins. Compare calculated
+   durations with a tight tolerance, but compare saved totals and retained
+   observation timestamps exactly against their original values.

@@ -143,7 +143,9 @@ async def test_communication_diagnostics_remain_available_during_slowdown(public
 
 
 @pytest.mark.asyncio
-async def test_integral_publishes_unavailable_without_losing_restore_total(publication_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_integral_publishes_unavailable_without_losing_restore_total(
+    publication_hass: HomeAssistant, monkeypatch: pytest.MonkeyPatch, clock_start: float
+) -> None:
     from .test_riemann_readiness import make_integral, observe
 
     entity, hub = make_integral()
@@ -151,7 +153,7 @@ async def test_integral_publishes_unavailable_without_losing_restore_total(publi
     entity.entity_id = "sensor.integral_readiness"
     # Use real HA publication instead of the arithmetic-only fixture's mock.
     del entity.async_write_ha_state
-    clock = [1000.0]
+    clock = [clock_start]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     with patch("custom_components.solax_modbus.sensor.async_call_later") as later:
         observe(hub, clock, 3600)
@@ -165,11 +167,13 @@ async def test_integral_publishes_unavailable_without_losing_restore_total(publi
         assert publication_hass.states.is_state(entity.entity_id, "unavailable")
         state = publication_hass.states.get(entity.entity_id)
         assert state is not None
-        assert entity.extra_restore_state_data.as_dict()["energy"] == 0.015
+        saved_energy = entity.extra_restore_state_data.as_dict()["energy"]
+        assert saved_energy == pytest.approx(0.015, rel=0, abs=1e-12)
         clock[0] += 600
         observe(hub, clock, 0)
         entity.modbus_data_updated()
         assert publication_hass.states.is_state(entity.entity_id, "0.015")
+        assert entity.extra_restore_state_data.as_dict()["energy"] == saved_energy
 
 
 @pytest.mark.parametrize("bad", [None, float("nan"), float("inf"), float("-inf")])
