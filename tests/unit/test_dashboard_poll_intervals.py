@@ -85,7 +85,7 @@ def setup_poll(fast: int = 5, slow: int = 15) -> tuple[Any, Any, Any, Any]:
 @pytest.mark.parametrize(("fast", "slow"), [(5, 15), (7, 23), (15, 5)])
 async def test_tcworld_sequence_keeps_computed_power_between_groups(fast: int, slow: int, monkeypatch: pytest.MonkeyPatch) -> None:
     hub, ed, power, settings = setup_poll(fast, slow)
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -146,7 +146,7 @@ async def test_topology_poll_does_not_renew_power_lease(interval_hass: HomeAssis
     entity.hass = interval_hass
     entity.entity_id = "sensor.mixed_interval_power"
     await entity.async_added_to_hass()
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)
@@ -171,7 +171,7 @@ async def test_required_dependencies_expire_individually(monkeypatch: pytest.Mon
     hub.sensorDescriptions["measured_power"] = replace(hub.sensorDescriptions["measured_power"], scan_group="scan_interval")
     power.device_groups["power"].holdingBlocks[0].descriptions = {0: hub.sensorDescriptions["inverter_power"]}
     settings.device_groups["settings"].holdingBlocks[0].descriptions[1] = hub.sensorDescriptions["measured_power"]
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -259,7 +259,7 @@ async def test_topology_changes_select_only_current_mapping() -> None:
 @pytest.mark.asyncio
 async def test_identical_power_is_a_new_observation_but_topology_is_not(monkeypatch: pytest.MonkeyPatch) -> None:
     hub, ed, power, settings = setup_poll()
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -282,7 +282,7 @@ async def test_invalid_input_publishes_unknown_then_expires(interval_hass: HomeA
     entity.hass = interval_hass
     entity.entity_id = "sensor.invalid_input_power"
     await entity.async_added_to_hass()
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)
@@ -313,7 +313,7 @@ async def test_invalid_input_publishes_unknown_then_expires(interval_hass: HomeA
 @pytest.mark.asyncio
 async def test_dashboard_also_expires_a_faster_topology_input(monkeypatch: pytest.MonkeyPatch) -> None:
     hub, ed, power, settings = setup_poll(15, 5)
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     await hub._refresh_interval_group_once(settings)
     await hub._refresh_interval_group_once(power)
@@ -416,7 +416,7 @@ async def test_integral_uses_shortest_required_input_lease_and_breaks_silent_gap
     hub.sensorDescriptions["measured_power"] = replace(hub.sensorDescriptions["measured_power"], scan_group="scan_interval")
     power.device_groups["power"].holdingBlocks[0].descriptions = {0: hub.sensorDescriptions["inverter_power"]}
     settings.device_groups["settings"].holdingBlocks[0].descriptions[1] = hub.sensorDescriptions["measured_power"]
-    clock = [time.monotonic()]
+    clock = [1000.0]
     monkeypatch.setattr(time, "monotonic", lambda: clock[0])
     later = Mock()
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", later)

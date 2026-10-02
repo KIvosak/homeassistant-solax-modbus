@@ -1,6 +1,5 @@
 """Energy integrals must not turn communication gaps into measured energy."""
 
-import time
 from dataclasses import replace
 from datetime import timedelta
 from types import SimpleNamespace
@@ -21,7 +20,8 @@ from .test_poll_snapshot import make_group, make_hub, successful_block
 @pytest.fixture
 def clock(monkeypatch: pytest.MonkeyPatch) -> list[float]:
     """Control sample/expiry time without sleeping or accessing a device."""
-    now = [time.monotonic()]
+    # Use an exact origin instead of inheriting host uptime and float spacing.
+    now = [1000.0]
     monkeypatch.setattr("custom_components.solax_modbus.sensor.time.monotonic", lambda: now[0])
     monkeypatch.setattr("custom_components.solax_modbus.sensor.async_call_later", Mock())
     return now
@@ -351,7 +351,7 @@ def test_source_interval_controls_expiry(clock: list[float], monkeypatch: pytest
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["unknown", "unavailable"])
-@pytest.mark.parametrize("start", [1000.0, 1.1, 1.4])
+@pytest.mark.parametrize("start", [1000.0, 1.1, 1.4, 113.2])
 async def test_restart_during_outage_restores_saved_total(clock: list[float], state: str, start: float) -> None:
     # Fractional clock origins expose subtraction rounding on either platform.
     clock[0] = start
