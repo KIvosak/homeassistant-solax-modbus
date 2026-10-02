@@ -538,12 +538,13 @@ class SolaXModbusSensor(SensorEntity):
             and description.key not in COMMUNICATION_SENSOR_KEYS
             and not getattr(description, "_is_riemann_sum_sensor", False)
         ):
-            self._computed_available = True
+            remaining_age = self._hub.computed_sensor_remaining_age(description)
+            self._computed_available = remaining_age > 0
             if self._cancel_computed_expiry is not None:
                 self._cancel_computed_expiry()
             # Only accepted computations publish this callback. A failed poll
             # cannot renew the lease; a timer also handles complete poll silence.
-            self._cancel_computed_expiry = async_call_later(self.hass, self._hub.computed_sensor_max_age(description), self._expire_computed)
+            self._cancel_computed_expiry = async_call_later(self.hass, remaining_age, self._expire_computed)
         self._attr_extra_state_attributes = _energy_dashboard_mapping_attrs(self.entity_description, self._hub)
         self.async_write_ha_state()
 
@@ -631,6 +632,7 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
         self._filter_function = (riemann_mapping.filter_function if riemann_mapping else None) or (lambda v: v)
         self._last_power_value: float | None = None
         self._last_update_time: float | None = None
+        self._last_source_deadline: float | None = None
         self._total_energy: float = 0.0  # kWh
         self._has_valid_total = False
         self._last_source_key: str | None = None
@@ -642,6 +644,7 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
         """Avoid integrating the time while the dashboard entity was inactive."""
         self._last_power_value = None
         self._last_update_time = None
+        self._last_source_deadline = None
         self._last_source_key = None
         self._last_source_hub = None
 
@@ -746,10 +749,12 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
             self._invalidate_power_sample()
             return
         max_age = data_hub.computed_sensor_max_age(SimpleNamespace(key=None, depends_on=[source_key]))
+        observation = data_hub._accepted_input_sample(source_key, include_pending=False)
+        deadline = observation[2] if observation is not None else current_time + max_age
         if (
             self._last_source_hub is not data_hub
             or self._last_source_key != source_key
-            or (self._last_update_time is not None and current_time - self._last_update_time > max_age)
+            or (self._last_source_deadline is not None and current_time >= self._last_source_deadline)
         ):
             self._energy_dashboard_reactivated()
         # Topology refreshes and unrelated polls are not new power observations.
@@ -757,11 +762,12 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
             return
         self._last_source_key = source_key
         self._last_source_hub = data_hub
+        self._last_source_deadline = deadline
         self._computed_available = True
         self._has_valid_total = True
         if self._cancel_computed_expiry is not None:
             self._cancel_computed_expiry()
-        self._cancel_computed_expiry = async_call_later(self.hass, max(0.0, max_age - (time.monotonic() - current_time)), self._expire_computed)
+        self._cancel_computed_expiry = async_call_later(self.hass, max(0.0, deadline - time.monotonic()), self._expire_computed)
         current_date = dt_util.now().date()
 
         # Reset daily totals at midnight (local time)

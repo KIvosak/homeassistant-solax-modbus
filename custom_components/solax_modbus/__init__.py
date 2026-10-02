@@ -2185,6 +2185,7 @@ class SolaXModbusHub:
                 source_data.pop(key, None)
         ready, required, alternative_groups, optional = self._computed_sensor_ready(descr, source_data, descriptions)
         if not ready:
+            self._remember_computed_sample(descr, None, source_data, accepted)
             return False
 
         if not force and not getattr(descr, "recompute_each_poll", False):
@@ -2202,21 +2203,79 @@ class SolaXModbusHub:
             value = descr.value_function(0, descr, source_data)
         except Exception as ex:
             _LOGGER.debug("%s: cannot compute value for %s: %s", self._name, descr.key, ex)
+            self._remember_computed_sample(descr, None, source_data, accepted)
             return False
 
         if (value is None and not getattr(descr, "allow_none", False)) or (isinstance(value, float) and not math.isfinite(value)):
             _LOGGER.debug("%s: refusing invalid computed value for %s", self._name, descr.key)
+            self._remember_computed_sample(descr, None, source_data, accepted)
             return False
         data[descr.key] = value
+        self._remember_computed_sample(descr, value, source_data, accepted)
         return True
+
+    def _input_observations(self, *, include_pending: bool = True) -> dict[str, tuple[float, Any, float]]:
+        """Use staged group observations until its validation has completed."""
+        pending = getattr(self, "_pending_input_observations", None)
+        return pending if include_pending and pending is not None else getattr(self, "_computed_input_observations", {})
+
+    def _accepted_input_sample(
+        self, key: str, seen: frozenset[str] = frozenset(), *, include_pending: bool = True
+    ) -> tuple[float, Any, float] | None:
+        """Bound each input by its own lease and reject failed computed dependencies."""
+        sample = self._input_observations(include_pending=include_pending).get(key)
+        if sample is None or key in seen or _mtime.monotonic() >= sample[2] or not self._computed_input_available({key: sample[1]}, key):
+            return None
+        descr = self.sensorDescriptions.get(key)
+        if descr is not None and getattr(descr, "register", -1) < 0:
+            required = self._active_dependency_keys(getattr(descr, "depends_on", None), self.data, self.sensorDescriptions)
+            if any(self._accepted_input_sample(dep, seen | {key}, include_pending=include_pending) is None for dep in required):
+                return None
+            for alternatives in getattr(descr, "depends_on_any", None) or []:
+                if not any(self._accepted_input_sample(dep, seen | {key}, include_pending=include_pending) is not None for dep in alternatives):
+                    return None
+        return sample
+
+    def _remember_computed_sample(self, descr: Any, value: Any, data: dict[str, Any], accepted: set[str]) -> None:
+        """A computation inherits input deadlines, rather than renewing old inputs."""
+        observations = getattr(self, "_pending_input_observations", None)
+        if observations is None:
+            return
+        _ready, required, alternatives, optional = self._computed_sensor_ready(descr, data, self.sensorDescriptions)
+        keys = required | optional.intersection(accepted)
+        for group in alternatives:
+            keys.update(group.intersection(accepted))
+        samples = [sample for key in keys if (sample := self._accepted_input_sample(key)) is not None]
+        now = _mtime.monotonic()
+        observations[descr.key] = (
+            max((sample[0] for sample in samples), default=now),
+            value,
+            min(sample[2] for sample in samples) if samples else now + self.computed_sensor_max_age(descr),
+        )
+
+    def computed_sensor_remaining_age(self, descr: Any) -> float:
+        """Expire the publication at the accepted inputs' absolute deadline."""
+        sample = self._input_observations().get(descr.key)
+        return max(0.0, sample[2] - _mtime.monotonic()) if sample is not None else self.computed_sensor_max_age(descr)
 
     def _computed_inputs(
         self, data: dict[str, Any], fresh_keys: set[str], dependencies: set[str], interval: float | None
     ) -> tuple[dict[str, Any], set[str]]:
-        """Add bounded raw inputs from other intervals without widening freshness."""
+        """Reuse accepted raw/computed inputs without calling them new observations."""
         source_data, accepted = data.copy(), fresh_keys.copy()
         if interval is not None and hasattr(self, "config"):
+            observations = self._input_observations()
+            for key in dependencies.intersection(observations):
+                sample = self._accepted_input_sample(key)
+                if sample is None:
+                    accepted.discard(key)
+                    source_data[key] = None
+                else:
+                    source_data[key] = sample[1]
+                    accepted.add(key)
             for key in dependencies - accepted:
+                if key in observations:
+                    continue  # A failed/invalid latest observation supersedes snapshots.
                 source = self.sensorDescriptions.get(key)
                 if source is None or getattr(source, "register", -1) < 0:
                     continue
@@ -2277,6 +2336,21 @@ class SolaXModbusHub:
         unrelated interval's overlay must not re-date an older power sample.
         """
         candidates = [(interval, (_mtime.monotonic(), data, fresh_keys))]
+        observations = self._input_observations(include_pending=bool(data))
+        if observations and not require_source_sample:
+            snapshot = (data or self.data).copy()
+            # Topology must be validated before resolving the selected source.
+            if mapping.source_key_pm and "parallel_setting" in self.sensorDescriptions:
+                topology = self._accepted_input_sample("parallel_setting", include_pending=bool(data))
+                if topology is None:
+                    return None
+                snapshot["parallel_setting"] = topology[1]
+            source_key = mapping.get_source_key(snapshot)
+            sample = self._accepted_input_sample(source_key, include_pending=bool(data))
+            if sample is None:
+                return None
+            snapshot[source_key] = sample[1]
+            return sample[0], snapshot
         if not data:
             candidates.extend(sorted(getattr(self, "_computed_source_snapshots", {}).items(), key=lambda sample: sample[1][0], reverse=True))
         dependencies = {mapping.source_key}
@@ -2300,6 +2374,9 @@ class SolaXModbusHub:
             if _mtime.monotonic() - timestamp > self.computed_sensor_max_age(description):
                 continue
             if required.issubset(accepted) and all(self._computed_input_available(snapshot, key) for key in required):
+                if observations:
+                    sample = self._accepted_input_sample(source_key, include_pending=bool(data))
+                    return (sample[0], snapshot) if sample is not None else None
                 return timestamp, snapshot
             if require_source_sample:
                 return None
@@ -2310,8 +2387,10 @@ class SolaXModbusHub:
         mapping = descr._energy_dashboard_mapping
         hubs = getattr(descr, "_energy_dashboard_source_hubs", None) or (descr._energy_dashboard_source_hub or self,)
         sources = []
+        source_samples = []
+        source_deadlines = []
         for hub in hubs:
-            if hub is self:
+            if hub is self and not hub._input_observations():
                 selected = mapping.get_source_key(data)
                 relevant = {selected}
                 if mapping.source_key_pm:
@@ -2327,8 +2406,20 @@ class SolaXModbusHub:
                 # ED counters explicitly propagate unknown; never partially sum
                 # an unavailable inverter into a total_increasing counter.
                 data[descr.key] = None
+                observations = getattr(self, "_pending_input_observations", None)
+                if observations is not None:
+                    previous = observations.get(descr.key)
+                    now = _mtime.monotonic()
+                    observations[descr.key] = (now, None, previous[2] if previous else now + self.computed_sensor_max_age(descr))
                 return True
             sources.append(snapshot)
+            sample = hub._accepted_input_sample(mapping.get_source_key(snapshot), include_pending=hub is self)
+            if sample is not None:
+                source_samples.append(sample)
+                source_deadlines.append(sample[2])
+                topology = hub._accepted_input_sample("parallel_setting", include_pending=hub is self) if mapping.source_key_pm else None
+                if topology is not None:
+                    source_deadlines.append(topology[2])
         source_data = sources[0].copy()
         source_data["_energy_dashboard_source_data"] = sources
         try:
@@ -2339,6 +2430,9 @@ class SolaXModbusHub:
         if isinstance(value, float) and not math.isfinite(value):
             value = None
         data[descr.key] = value
+        observations = getattr(self, "_pending_input_observations", None)
+        if observations is not None and source_samples:
+            observations[descr.key] = (max(sample[0] for sample in source_samples), value, min(source_deadlines))
         return True
 
     def _ordered_computed_sensors(self) -> list[tuple[str, Any]]:
@@ -2456,19 +2550,48 @@ class SolaXModbusHub:
                 data[key] = self.data[key]
 
         computed_fresh_keys: set[str] = set()
+        # Per-key observations distinguish an unrelated device group from a
+        # failed read of this key, including groups sharing the same interval.
+        attempted = set(fresh_keys)
+        for block in (*group.holdingBlocks, *group.inputBlocks):
+            for description in getattr(block, "descriptions", {}).values():
+                descriptions = description.values() if isinstance(description, dict) else (description,)
+                attempted.update(descr.key for descr in descriptions)
+        observations = getattr(self, "_computed_input_observations", {}).copy()
+        now = _mtime.monotonic()
+        for key in attempted:
+            descr = self.sensorDescriptions.get(key)
+            max_age = (
+                3 * float(self.scan_group(SimpleNamespace(entity_description=descr)))
+                if descr is not None and hasattr(self, "config")
+                else 3 * float(getattr(group, "computed_interval", None) or DEFAULT_SCAN_INTERVAL)
+            )
+            observations[key] = (now, data.get(key) if key in fresh_keys else None, now + max_age)
+        self._pending_input_observations = observations
         if poll_outcome.communication_succeeded:
             # Use a copy: a rejected group must not contribute raw or computed
             # freshness to subsequent groups in this polling cycle.
-            if cycle_fresh_keys is not None:
-                fresh_keys.update(cycle_fresh_keys)
-            computed_fresh_keys = self._compute_poll_sensors(data, fresh_keys, getattr(group, "computed_interval", None))
-
-            if group.readFollowUp is not None:
-                if not await group.readFollowUp(previous_data, data):
-                    _LOGGER.warning("%s: device group validation failed; discarding this device group's snapshot", self._name)
-                    return PollOutcome.DISCARDED
+            try:
+                if cycle_fresh_keys is not None:
+                    fresh_keys.update(cycle_fresh_keys)
+                computed_fresh_keys = self._compute_poll_sensors(data, fresh_keys, getattr(group, "computed_interval", None))
+                accepted_group = group.readFollowUp is None or await group.readFollowUp(previous_data, data)
+            except Exception:
+                rejected = getattr(self, "_computed_input_observations", {}).copy()
+                rejected.update({key: (now, None, now) for key in attempted})
+                self._computed_input_observations = rejected
+                raise
+            finally:
+                self._pending_input_observations = None
+            if not accepted_group:
+                _LOGGER.warning("%s: device group validation failed; discarding this device group's snapshot", self._name)
+                rejected = getattr(self, "_computed_input_observations", {}).copy()
+                rejected.update({key: (now, None, now) for key in attempted})
+                self._computed_input_observations = rejected
+                return PollOutcome.DISCARDED
 
             self._commit_poll_snapshot(previous_data, data)
+            self._computed_input_observations = observations
             if cycle_fresh_keys is not None:
                 cycle_fresh_keys.update(fresh_keys)
             if local_callback_needed:
@@ -2485,6 +2608,10 @@ class SolaXModbusHub:
                     except Exception:
                         _LOGGER.debug("%s: cannot send update for %s - probably disabled ", self._name, key)
             group.publish_updates = True
+
+        else:
+            self._computed_input_observations = observations
+            self._pending_input_observations = None
 
         if poll_outcome.communication_succeeded and not required_block_failed and self.writequeue and self.plugin.isAwake(self.data):
             # process outstanding write requests
@@ -2696,6 +2823,7 @@ class SolaXModbusHub:
 
     def rebuild_blocks(self, initial_groups: dict[Any, Any]) -> None:  # , computedRegs):
         self._computed_source_snapshots = {}
+        self._computed_input_observations = {}
         _LOGGER.debug("%s: rebuilding groups and blocks - pre: %s", self._name, initial_groups.keys())
         self.initial_groups = initial_groups
         for interval, interval_group in initial_groups.items():
