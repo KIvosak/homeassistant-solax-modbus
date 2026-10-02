@@ -1305,12 +1305,15 @@ class SolaXModbusHub:
             outcomes.append(group_outcome)
             if group_outcome.communication_succeeded and getattr(group, "publish_updates", True):
                 for sensor in group.sensors:
-                    try:
-                        sensor.modbus_data_updated()
-                    except Exception:
-                        _LOGGER.exception(
-                            "%s: failed to update sensor %s", self._name, getattr(sensor, "entity_id", getattr(sensor, "name", "unknown"))
-                        )
+                    # Energy integrals consume the completed interval snapshot,
+                    # never a previous snapshot while this poll is in flight.
+                    if getattr(sensor.entity_description, "_is_riemann_sum_sensor", False) is not True:
+                        try:
+                            sensor.modbus_data_updated()
+                        except Exception:
+                            _LOGGER.exception(
+                                "%s: failed to update sensor %s", self._name, getattr(sensor, "entity_id", getattr(sensor, "name", "unknown"))
+                            )
                 updated_sensors += len(group.sensors)
                 if getattr(self, "gatedEntities", None):
                     await self.async_refresh_gated_entities()
@@ -1322,6 +1325,12 @@ class SolaXModbusHub:
         snapshot_key = getattr(interval_group, "interval", None) or id(interval_group)
         snapshots[snapshot_key] = (_mtime.monotonic(), self.data.copy(), cycle_fresh_keys.copy())
         self._computed_source_snapshots = snapshots
+
+        # Notify on failed/discarded polls too, so integrals break the interval
+        # instead of bridging missing measurements on the next successful read.
+        for sensor in list(self.sensorEntities.values()):
+            if getattr(sensor.entity_description, "_is_riemann_sum_sensor", False) is True:
+                sensor.modbus_data_updated()
 
         if PollOutcome.FAILED in outcomes:
             outcome = PollOutcome.FAILED
@@ -2233,6 +2242,10 @@ class SolaXModbusHub:
 
     def computed_sensor_max_age(self, descr: Any) -> float:
         """Allow three configured input intervals, independent of poll slowdown."""
+        return 3 * max(self._computed_source_intervals(descr))
+
+    def _computed_source_intervals(self, descr: Any) -> list[float]:
+        """Find configured raw-input intervals through computed dependencies."""
         pending = [descr]
         seen: set[str] = set()
         intervals: list[float] = []
@@ -2249,12 +2262,29 @@ class SolaXModbusHub:
                 dependencies.extend(alternatives)
             pending.extend(self.sensorDescriptions[key] for key in dependencies if key in self.sensorDescriptions)
         fallback = float(getattr(self, "config", {}).get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))
-        return 3 * max(intervals, default=fallback)
+        return intervals or [fallback]
 
     def _dashboard_source_data(
         self, mapping: Any, data: dict[str, Any], fresh_keys: set[str], interval: float | None = None
     ) -> dict[str, Any] | None:
         """Resolve a mapping against a coherent, bounded-age source-hub snapshot."""
+        sample = self._dashboard_source_sample(mapping, data, fresh_keys, interval)
+        return sample[1] if sample is not None else None
+
+    def _dashboard_source_sample(
+        self,
+        mapping: Any,
+        data: dict[str, Any],
+        fresh_keys: set[str],
+        interval: float | None = None,
+        *,
+        require_source_sample: bool = False,
+    ) -> tuple[float, dict[str, Any]] | None:
+        """Return accepted data and its monotonic observation time.
+
+        Integrals require a new observation of the selected power itself; an
+        unrelated interval's overlay must not re-date an older power sample.
+        """
         candidates = [(interval, (_mtime.monotonic(), data, fresh_keys))]
         if not data:
             candidates.extend(sorted(getattr(self, "_computed_source_snapshots", {}).items(), key=lambda sample: sample[1][0], reverse=True))
@@ -2262,16 +2292,26 @@ class SolaXModbusHub:
         if mapping.source_key_pm:
             dependencies.update((mapping.source_key_pm, "parallel_setting"))
         for source_interval, (timestamp, snapshot, accepted) in candidates:
+            observed = accepted
             snapshot, accepted = self._computed_inputs(snapshot, accepted, dependencies, source_interval)
             source_key = mapping.get_source_key(snapshot)
+            if require_source_sample and source_key not in observed:
+                source_description = SimpleNamespace(key=None, depends_on=[source_key])
+                if source_interval in self._computed_source_intervals(source_description):
+                    # A newer failed source interval supersedes older accepted
+                    # computations from any other interval. Do not bridge it.
+                    return None
+                continue
             required = {source_key}
             if mapping.source_key_pm and ("parallel_setting" in self.sensorDescriptions or "parallel_setting" in snapshot):
                 required.add("parallel_setting")
-            description = SimpleNamespace(key=source_key, depends_on=list(required))
+            description = SimpleNamespace(key=None, depends_on=list(required))
             if _mtime.monotonic() - timestamp > self.computed_sensor_max_age(description):
                 continue
             if required.issubset(accepted) and all(self._computed_input_available(snapshot, key) for key in required):
-                return snapshot
+                return timestamp, snapshot
+            if require_source_sample:
+                return None
         return None
 
     def _evaluate_dashboard_sensor(self, descr: Any, data: dict[str, Any], fresh_keys: set[str], interval: float | None = None) -> bool:
