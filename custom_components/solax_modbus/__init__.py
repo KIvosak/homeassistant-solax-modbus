@@ -929,6 +929,10 @@ class SolaXModbusHub:
                     val = loaded.get(desc)
                     if val is not None:
                         self.data[desc] = val
+                    elif getattr(self.writeLocals[desc], "async_write_function", None) is not None:
+                        # Transactional controls must distinguish an unknown device
+                        # parameter from a default used for an explicit new command.
+                        self.data.setdefault(desc, None)
                     else:
                         self.data[desc] = self.writeLocals[desc].initvalue  # first time initialisation
             else:
@@ -1304,7 +1308,12 @@ class SolaXModbusHub:
                     # Energy integrals consume the completed interval snapshot,
                     # never a previous snapshot while this poll is in flight.
                     if getattr(sensor.entity_description, "_is_riemann_sum_sensor", False) is not True:
-                        sensor.modbus_data_updated()
+                        try:
+                            sensor.modbus_data_updated()
+                        except Exception:
+                            _LOGGER.exception(
+                                "%s: failed to update sensor %s", self._name, getattr(sensor, "entity_id", getattr(sensor, "name", "unknown"))
+                            )
                 updated_sensors += len(group.sensors)
                 if getattr(self, "gatedEntities", None):
                     await self.async_refresh_gated_entities()

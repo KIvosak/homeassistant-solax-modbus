@@ -10,7 +10,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 
 from custom_components.solax_modbus import sensor
-from custom_components.solax_modbus.const import CONF_READ_BATTERY, DOMAIN
+from custom_components.solax_modbus.const import CONF_READ_BATTERY, DOMAIN, INVERTER_IDENT
 from custom_components.solax_modbus.plugin_sofar import battery_config
 
 
@@ -27,21 +27,47 @@ async def test_pack_metadata_updated_only_after_validation(
         battery_sensor_key_prefix="battery_{batt-nr}_{pack-nr}_",
     )
     devices = {f"battery_1_{i}": SimpleNamespace(id=f"pack-device-{i}", serial_number=f"OLD-{i}") for i in (1, 2)}
+    devices[INVERTER_IDENT] = SimpleNamespace(id="inverter-device")
+
+    def get_device_by_identifier(identifier: tuple[str, str, str], config_entry_id: str) -> SimpleNamespace | None:
+        assert config_entry_id == "entry"
+        assert identifier[:2] == (DOMAIN, "Sofar")
+        return devices.get(identifier[2])
+
+    def get_device(*, identifiers: set[tuple[str, str, str]]) -> SimpleNamespace | None:
+        assert len(identifiers) == 1
+        return get_device_by_identifier(next(iter(identifiers)), "entry")
 
     def update_device(device_id: str, **changes: Any) -> None:
         device = next(device for device in devices.values() if device.id == device_id)
         for key, value in changes.items():
             setattr(device, key, value)
 
-    registry = SimpleNamespace(
-        async_update_device=Mock(side_effect=update_device),
-        async_get_device=Mock(side_effect=lambda *, identifiers: devices.get(next(iter(identifiers))[2])),
-    )
     if scoped_registry:
-        registry.async_get_device_by_identifier = Mock(side_effect=lambda identifier, entry_id: devices.get(identifier[2]))
+        # HA 2026.8+: scoped API available; legacy API must not be used.
+        registry = SimpleNamespace(
+            async_update_device=Mock(side_effect=update_device),
+            async_get_device_by_identifier=Mock(side_effect=lambda identifier, entry_id: devices.get(identifier[2])),
+            async_get_device=Mock(return_value=None),
+        )
+    else:
+        # HA < 2026.8: only the legacy ``async_get_device`` lookup exists,
+        # so ``_scoped_lookup`` must fall through to it (no scoped lookup present).
+        def legacy_lookup(identifiers: Any = None) -> Any:
+            for ident in identifiers:
+                if ident[2] in devices:
+                    return devices[ident[2]]
+            return None
+
+        registry = SimpleNamespace(
+            async_update_device=Mock(side_effect=update_device),
+            async_get_device_by_identifier=None,
+            async_get_device=Mock(side_effect=legacy_lookup),
+        )
     monkeypatch.setattr(dr, "async_get", lambda hass: registry)
     callbacks: list[Any] = []
-    monkeypatch.setattr(sensor, "entityToList", lambda *args: callbacks.append(args[-1]))
+    entity_to_list = Mock(side_effect=lambda *args: callbacks.append(args[-1]))
+    monkeypatch.setattr(sensor, "entityToList", entity_to_list)
     monkeypatch.setattr(sensor, "entityToListSingle", Mock())
 
     async def select(hub: Any, batt_nr: int, pack_nr: int) -> bool:

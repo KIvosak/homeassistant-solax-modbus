@@ -1,6 +1,6 @@
 import logging
 import pathlib
-from collections.abc import Callable, Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -338,6 +338,8 @@ class BaseModbusSelectEntityDescription(SelectEntityDescription):
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
     value_function: Callable[[Any, Any, dict[str, Any]], Any] | None = None  # value function for autorepeat (same pattern as buttons)
     autorepeat: bool = False  # if True: select will use value_function for autorepeat
+    # Optional transactional writer: (hub, unit, description, raw value). Must raise on failure.
+    async_write_function: Callable[[Any, int, Any, int | float], Awaitable[None]] | None = None
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -421,6 +423,8 @@ class BaseModbusNumberEntityDescription(NumberEntityDescription):
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
     display_as_box: bool = True  # display numbers as an input box (default); set False for a slider.
     suggested_display_precision: int | None = None
+    # Optional transactional writer: (hub, unit, description, raw value). Must raise on failure.
+    async_write_function: Callable[[Any, int, Any, int | float], Awaitable[None]] | None = None
 
 
 def modbus_protocol_version(hub: Any) -> int:
@@ -537,19 +541,23 @@ def value_function_battery_input(initval: Any, descr: Any, datadict: dict[str, A
     return 0
 
 
-def value_function_battery_output_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float:
+def value_function_battery_output_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float | None:
     """Calculate battery output power for Solis inverters."""
-    inout: int = datadict.get("battery_charge_direction", 0)
-    val: int | float = datadict.get("battery_power", 0)
+    inout = datadict.get("battery_charge_direction")
+    val: int | float | None = datadict.get("battery_power")
+    if inout not in (0, 1) or val is None:
+        return None
     if inout == 1:
         return abs(val)
     return 0
 
 
-def value_function_battery_input_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float:
+def value_function_battery_input_solis(initval: Any, descr: Any, datadict: dict[str, Any]) -> int | float | None:
     """Calculate battery input power for Solis inverters."""
-    inout: int = datadict.get("battery_charge_direction", 0)
-    val: int | float = datadict.get("battery_power", 0)
+    inout = datadict.get("battery_charge_direction")
+    val: int | float | None = datadict.get("battery_power")
+    if inout not in (0, 1) or val is None:
+        return None
     if inout == 0:
         return val
     return 0

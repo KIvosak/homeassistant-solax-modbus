@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import homeassistant.util.dt as dt_util
-from homeassistant.components.sensor import SensorEntity
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_NAME, PERCENTAGE, STATE_UNAVAILABLE, STATE_UNKNOWN, EntityCategory
 from homeassistant.core import HomeAssistant, callback
@@ -478,6 +478,14 @@ class SolaXModbusSensor(SensorEntity):
             # precision, hiding real decimals or padding integers with a fake ".0".
             expressible = 0 if scale >= 1 else math.ceil(-math.log10(scale))
             self._attr_suggested_display_precision = min(expressible, description.rounding)
+        elif isinstance(scale, dict) and all(isinstance(opt, str) for opt in scale.values()) and description.native_unit_of_measurement is None:
+            # If the sensor has a set of distinct string options as reported by its value
+            # function being a dict, then inform HA of the available options.
+            # Only apply ENUM when there is no unit of measurement — a unit implies
+            # a numeric value and HA rejects the combination of a unit with a
+            # non-numeric device class (e.g. Growatt eps_set_voltage in V).
+            self._attr_options = list(scale.values())
+            self._attr_device_class = SensorDeviceClass.ENUM
 
     @callback
     def set_energy_dashboard_active(self, active: bool) -> None:
