@@ -351,7 +351,10 @@ def test_source_interval_controls_expiry(clock: list[float], monkeypatch: pytest
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["unknown", "unavailable"])
-async def test_restart_during_outage_restores_saved_total(clock: list[float], state: str) -> None:
+@pytest.mark.parametrize("start", [1000.0, 1.1, 1.4])
+async def test_restart_during_outage_restores_saved_total(clock: list[float], state: str, start: float) -> None:
+    # Fractional clock origins expose subtraction rounding on either platform.
+    clock[0] = start
     entity, hub = make_integral()
     observe(hub, clock, 3600)
     entity.modbus_data_updated()
@@ -360,17 +363,20 @@ async def test_restart_during_outage_restores_saved_total(clock: list[float], st
     entity.modbus_data_updated()
     entity._expire_computed(None)
     saved_extra = entity.extra_restore_state_data
-    assert saved_extra.as_dict()["energy"] == 0.015
+    saved_energy = saved_extra.as_dict()["energy"]
+    assert saved_energy == pytest.approx(0.015, rel=0, abs=1e-12)
     restored, restored_hub = make_integral()
     restored.async_get_last_state = AsyncMock(return_value=SimpleNamespace(state=state, attributes={}))
     restored.async_get_last_extra_data = AsyncMock(return_value=saved_extra)
     restored_hub.async_add_solax_modbus_sensor = AsyncMock()
     restored_hub._name = None
     await restored.async_added_to_hass()
-    assert restored.native_value == 0.015
+    assert restored.extra_restore_state_data.as_dict()["energy"] == saved_energy
+    assert restored.native_value == saved_energy
     clock[0] += 600
     observe(restored_hub, clock, 3600)
     restored.modbus_data_updated()
+    assert restored.extra_restore_state_data.as_dict()["energy"] == saved_energy
     assert restored.native_value == 0.015
 
 
