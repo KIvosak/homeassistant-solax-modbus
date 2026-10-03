@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from time import time
@@ -1557,6 +1558,42 @@ def value_function_pm_total_pv_current(initval: int, descr: Any, datadict: dict[
         pv_current_2 = 0
 
     return int(pv_current_1 + pv_current_2)
+
+
+def _positive_input(data: dict[str, Any], key: str) -> bool:
+    value = data.get(key)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
+def battery_capacity_dependencies(data: dict[str, Any], active: set[str]) -> tuple[set[str], set[str]]:
+    """Use the total SoC alone, otherwise require every configured battery."""
+    if _positive_input(data, "battery_total_capacity_charge"):
+        return {"battery_total_capacity_charge"}, set()
+    required = active.intersection({"battery_1_capacity_charge", "battery_2_capacity_charge"})
+    if not required:
+        required = {"battery_total_capacity_charge"}
+    capacities = {"bms_battery_capacity", "bms_2_battery_capacity"}
+    optional = capacities if len(required) == 2 and all(_positive_input(data, key) for key in capacities | required) else set()
+    return required, optional
+
+
+def bms_charge_dependencies(data: dict[str, Any], active: set[str], battery: int = 1) -> tuple[set[str], set[str]]:
+    """Select the voltage/current actually used, including fallback splitting."""
+    voltages = ("battery_voltage_charge", "battery_1_voltage_charge") if battery == 1 else ("battery_2_voltage_charge",)
+    voltage = next((key for key in voltages if _positive_input(data, key)), next((key for key in voltages if key in active), voltages[0]))
+    current = "bms_charge_max_current" if battery == 1 else "bms_2_charge_max_current"
+    required = {voltage}
+    if data.get(current) is not None:
+        required.add(current)
+    else:
+        required.add("battery_charge_max_current")
+        other = ("battery_2_voltage_charge",) if battery == 1 else ("battery_voltage_charge", "battery_1_voltage_charge")
+        required.update(key for key in other if key in active)
+    return required, set()
+
+
+def bms_2_charge_dependencies(data: dict[str, Any], active: set[str]) -> tuple[set[str], set[str]]:
+    return bms_charge_dependencies(data, active, 2)
 
 
 def value_function_battery_capacity_gen5(initval: int, descr: Any, datadict: dict[str, Any]) -> int | None:
@@ -6668,6 +6705,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_battery_capacity_gen5,
+        dependency_selector=battery_capacity_dependencies,
         depends_on=["battery_total_capacity_charge", "battery_1_capacity_charge", "battery_2_capacity_charge"],
         optional_depends_on=["bms_battery_capacity", "bms_2_battery_capacity"],
         modbus_max=99,
@@ -8060,6 +8098,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery Max Charge Rate",
         key="bms_max_charge",
         value_function=value_function_bms_max_charge,
+        dependency_selector=bms_charge_dependencies,
         depends_on=["battery_voltage_charge", "battery_1_voltage_charge", "battery_2_voltage_charge"],
         depends_on_any=[
             ("battery_voltage_charge", "battery_1_voltage_charge"),
@@ -8076,6 +8115,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery 1 Max Charge Rate",
         key="bms_max_charge",
         value_function=value_function_bms_max_charge,
+        dependency_selector=bms_charge_dependencies,
         depends_on=["battery_voltage_charge", "battery_1_voltage_charge", "battery_2_voltage_charge"],
         depends_on_any=[
             ("battery_voltage_charge", "battery_1_voltage_charge"),
@@ -8092,6 +8132,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery 2 Max Charge Rate",
         key="bms_2_max_charge",
         value_function=value_function_bms_2_max_charge,
+        dependency_selector=bms_2_charge_dependencies,
         depends_on=["battery_2_voltage_charge", "battery_voltage_charge", "battery_1_voltage_charge"],
         depends_on_any=[("bms_2_charge_max_current", "battery_charge_max_current")],
         native_unit_of_measurement=UnitOfPower.WATT,
