@@ -1851,6 +1851,7 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         autorepeat_control="remotecontrol_power_control_mode",
         autorepeat_dependencies=(
             "parallel_setting",
+            "grid_export",
             "meter_2_measured_power",
             "selfuse_discharge_min_soc",
             "battery_charge_upper_soc",
