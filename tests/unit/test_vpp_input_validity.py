@@ -121,23 +121,34 @@ async def test_bms_fallback_selects_real_current_and_voltage(battery: int, bms_c
 
 
 @pytest.mark.asyncio
-async def test_bms_charge_limit_is_checked_only_on_charging_branch() -> None:
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "Mode 8 - PV and BAT control - Duration",
+        "Negative Injection Price",
+        "Negative Injection and Consumption Price",
+        "Enabled Feedin Priority",
+        "Enabled No Discharge",
+        "Export-First Battery Limit",
+    ],
+)
+@pytest.mark.parametrize(("pv", "grid"), [(0, -1000), (40000, 25000)])
+async def test_fixed_inputs_reject_unread_installed_bms_limits_in_every_submode(mode: str, pv: int, grid: int) -> None:
     hub, power, settings, values, function = setup_vpp()
+    hub.data["remotecontrol_power_control_mode"] = mode
+    values.update(pv_power_1=pv, measured_power=grid)
     for key in ("bms_max_charge", "bms_2_max_charge"):
         hub.sensorDescriptions[key] = computed(key)
         hub.data[key] = 8000
     await prime(hub, power, settings)
-    await hub._refresh_interval_group_once(power)
-    assert hub.data["remotecontrol_current_pushmode_power"] == 210  # Deficit requires no BMS charge input.
-    values.update(pv_power_1=10000, measured_power=1000)
     await hub._refresh_interval_group_once(power)
     assert function.call_args.args[0] == BUTTONREPEAT_POST
     assert hub.data["remotecontrol_current_pushmode_power"] is None
 
 
 @pytest.mark.asyncio
-async def test_selected_valid_total_bms_limit_ignores_missing_individual_limits() -> None:
-    hub, power, settings, values, _function = setup_vpp()
+async def test_fixed_inputs_require_installed_individual_limits_even_with_valid_total() -> None:
+    hub, power, settings, values, function = setup_vpp()
     key = "battery_max_charge_power"
     hub.sensorDescriptions[key] = replace(next(d for d in SENSOR_TYPES_MAIN if d.key == key), scan_group="scan_interval")
     values[key] = 6000
@@ -149,7 +160,9 @@ async def test_selected_valid_total_bms_limit_ignores_missing_individual_limits(
     values.update(pv_power_1=40000, measured_power=25000)
     await prime(hub, power, settings)
     await hub._refresh_interval_group_once(power)
-    assert hub.data["remotecontrol_current_pushmode_power"] < 0
+    assert hub.data[key] == 6000
+    assert function.call_args.args[0] == BUTTONREPEAT_POST
+    assert hub.data["remotecontrol_current_pushmode_power"] is None
 
 
 @pytest.mark.asyncio

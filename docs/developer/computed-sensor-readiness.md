@@ -192,10 +192,16 @@ topology input retain their default Free source selection.
 ## SolaX VPP lifecycle and cadence
 
 Autorepeat runs after the interval's device groups, rather than once per device
-group. The two SolaX control buttons declare `autorepeat_dependencies` and
-`autorepeat_cadence`. The cadence owner is the shortest configured raw polling
-interval reachable through the mode's required power keys in the cadence
-declaration. Settings, topology and BMS limits are validity dependencies, not
+group. The two SolaX control buttons declare fixed inputs across all their
+sub-modes. `depends_on` contains mandatory sources; `autorepeat_dependencies`
+contains model-specific sources that are required when installed.
+`autorepeat_parallel_dependencies` declares the fixed Free/Master input groups;
+Free never requires PM data. `autorepeat_control` identifies the local mode
+request so an explicit Disabled request can stop without measurement readiness.
+An unsupported topology reaches the existing controller's disable/no-op path.
+The cadence owner is the shortest configured raw polling
+interval reachable through the required power keys in `autorepeat_cadence`.
+Settings, topology and BMS limits are validity dependencies, not
 independent clock owners. For power at 5 s and settings at 15 s the owner is
 5 s; for 6/15 it is 6 s. No fixed interval or additional global throttle is
 applied. Other plugins retain one autorepeat call per interval refresh.
@@ -232,14 +238,23 @@ Gen5 total SoC is authoritative when valid and positive; unused per-battery
 fallbacks and capacity metadata cannot block it or shorten its deadline. A
 fallback requires every applicable battery SoC. Two valid positive capacities
 permit weighting; incomplete capacity metadata uses the conservative minimum.
-BMS power selects the voltage/current actually used, requiring the other
-battery's voltage when splitting a shared-current fallback. Control charge
-limits are required on charging branches; invalid installed individual limits
-cannot produce a partial BMS sum. A valid total charge limit can replace those
-individual estimates. Phase sums keep all applicable phases mandatory.
-The Mode 8 charging predicate is shared with input selection, including its
-integer conversions and PV-limit defaults, so validation cannot skip a BMS
-limit on a branch that actually charges. Slave modes 1-7 that produce an empty
+BMS functions use `battery_voltage_charge` for Gen4 and earlier, and
+`battery_1_voltage_charge`/`battery_2_voltage_charge` for Gen5 and later, following
+[PR #2359](https://github.com/wills106/homeassistant-solax-modbus/pull/2359).
+There is no voltage alias selection across generations. The current selector
+retains the dedicated BMS current or shared-current fallback and requires the
+installed peer voltage when splitting the fallback. An unused fallback does
+not shorten a dedicated-current lease. Phase sums keep all applicable phases
+mandatory.
+
+Every installed control input, including charge limits, must be valid in every
+sub-mode. A valid total charge limit does not excuse an invalid installed
+individual estimate. This conservative gate may stop a loop because of an
+input that its current sub-mode does not use. It does not inspect PV surplus,
+SoC, clipping or other regulator decisions to select dependencies. Both control
+loop bodies and their charge/filter/house-load helpers remain identical to
+upstream main; input validation does not change their equations or defaults.
+Slave modes 1-7 that produce an empty
 multi-write remain a no-op; explicit disable/expiry cleanup still writes its
 non-empty payload.
 

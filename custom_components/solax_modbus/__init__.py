@@ -2843,11 +2843,18 @@ class SolaXModbusHub:
             return payload
         active = self._autorepeat_active_keys()
         source = self._autorepeat_input_data(active)
-        try:
-            required = descr.autorepeat_dependencies(source, active)
-            ready = all(self._control_input_valid(key) for key in required)
-        except (TypeError, ValueError, OverflowError):
-            ready = False
+        disabled = source.get(descr.autorepeat_control, "Disabled") == "Disabled"
+        parallel = source.get("parallel_setting", "Free")
+        topologies = descr.autorepeat_parallel_dependencies
+        # Unsupported topology is handled by the unchanged controller (disable
+        # for Mode 8, no-op for a modes 1-7 Slave). No sub-mode math is evaluated.
+        stopping = disabled or (topologies is not None and (not isinstance(parallel, str) or parallel not in topologies))
+        required = set() if stopping else set(descr.depends_on or ()) | active.intersection(descr.autorepeat_dependencies)
+        if not stopping and topologies is not None:
+            required.update(topologies[parallel])
+        ready = all(self._control_input_valid(key) for key in required)
+        if not disabled and "parallel_setting" in active:
+            ready = ready and self._control_input_valid("parallel_setting")
         if not ready:
             self.data["_repeatUntil"][descr.key] = 0
             _LOGGER.warning("%s: stopping %s because a required control input is invalid", self._name, descr.key)

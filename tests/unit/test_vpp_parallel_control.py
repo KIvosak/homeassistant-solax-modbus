@@ -7,7 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
-from custom_components.solax_modbus.const import BUTTONREPEAT_LOOP
+from custom_components.solax_modbus.const import BUTTONREPEAT_LOOP, BUTTONREPEAT_POST
 from custom_components.solax_modbus.plugin_solax import BUTTON_TYPES, SENSOR_TYPES_MAIN, autorepeat_function_remotecontrol_recompute
 
 from .test_poll_snapshot import make_group
@@ -16,6 +16,7 @@ from .test_vpp_poll_cadence import computed, setup_vpp
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("reverse", [False, True])
+@pytest.mark.parametrize("invalid_phase", [False, True])
 @pytest.mark.parametrize(
     "mode",
     [
@@ -27,7 +28,7 @@ from .test_vpp_poll_cadence import computed, setup_vpp
         "Enabled No Discharge",
     ],
 )
-async def test_master_control_uses_accepted_pm_values_once(mode: str, reverse: bool) -> None:
+async def test_master_control_uses_accepted_pm_values_once(mode: str, reverse: bool, invalid_phase: bool) -> None:
     hub, power, settings, values, _function = setup_vpp()
     values.update(
         parallel_setting="Master",
@@ -38,6 +39,8 @@ async def test_master_control_uses_accepted_pm_values_once(mode: str, reverse: b
         pm_pv_power_2=2000,
         pm_battery_power_charge=0,
     )
+    if invalid_phase:
+        values["inverter_power_l2"] = True
     pm_keys = {key for key in values if key.startswith("pm_")}
     for key in pm_keys:
         hub.sensorDescriptions[key] = replace(next(d for d in SENSOR_TYPES_MAIN if d.key == key), scan_group="scan_interval_fast")
@@ -63,5 +66,9 @@ async def test_master_control_uses_accepted_pm_values_once(mode: str, reverse: b
     assert hub.data["pm_total_pv_power"] == 3500
     assert hub.data["pm_total_house_load"] == 2200
     assert function.call_count == hub.async_write_registers_multi.await_count == 1
+    if invalid_phase:
+        assert function.call_args.args[0] == BUTTONREPEAT_POST
+        assert hub.async_write_registers_multi.call_args.kwargs["payload"] == [("remotecontrol_power_control", "Disabled")]
+        return
     assert hub.async_write_registers_multi.call_args.kwargs["payload"] == expected["data"]
     assert dict(item for item in expected["data"] if isinstance(item[0], str)).get("remotecontrol_power_control") != "Disabled"

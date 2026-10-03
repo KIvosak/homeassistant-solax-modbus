@@ -13,13 +13,13 @@ from homeassistant.exceptions import HomeAssistantError
 from custom_components.solax_modbus import BlockReadResult, SolaXModbusHub
 from custom_components.solax_modbus.button import SolaXModbusButton
 from custom_components.solax_modbus.const import BUTTONREPEAT_FIRST, BUTTONREPEAT_LOOP, BUTTONREPEAT_POST, PollOutcome
-from custom_components.solax_modbus.plugin_solax import BUTTON_TYPES, NUMBER_TYPES, SELECT_TYPES, SENSOR_TYPES_MAIN
+from custom_components.solax_modbus.plugin_solax import BUTTON_TYPES, GEN5, NUMBER_TYPES, SELECT_TYPES, SENSOR_TYPES_MAIN
 
 from .test_poll_snapshot import make_group, make_hub, successful_block
 
 
 def computed(key: str) -> Any:
-    return next(d for d in SENSOR_TYPES_MAIN if d.key == key and d.register < 0)
+    return next(d for d in SENSOR_TYPES_MAIN if d.key == key and d.register < 0 and (key != "bms_max_charge" or d.allowedtypes & GEN5))
 
 
 def setup_vpp(fast: int = 5, slow: int = 15, count: int = 2, reverse: bool = False) -> tuple[Any, Any, Any, dict[str, Any], Mock]:
