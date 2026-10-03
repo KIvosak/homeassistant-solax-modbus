@@ -877,6 +877,25 @@ def autorepeat_setpoint_filter(current_value: int, desired_value: int, steps: in
     return int((current_value * (steps - 1) + desired_value) / steps)
 
 
+def _mode8_charge_path(data: dict[str, Any], pv: int | float, houseload: int | float, houseload_alt: int | float) -> bool:
+    """Use the same charge-path predicate for input validation and regulation."""
+    mode = data.get("remotecontrol_power_control_mode", "Disabled")
+    if mode == "Negative Injection and Consumption Price":
+        return True
+    if mode == "Enabled No Discharge":
+        return bool(pv >= houseload)
+    hl = max(0, int(houseload_alt))
+    if mode == "Export-First Battery Limit":
+        return bool(pv >= hl)
+    if mode == "Negative Injection Price":
+        limit = data.get("remotecontrol_pv_power_limit", 10000)
+        current_limit = data.get("remotecontrol_current_pv_power_limit")
+        current_limit = max(0, limit if current_limit is None else current_limit)
+        step = int(data.get("pv_unlimited_delta_w", 1000) or 1000)
+        return bool(pv >= hl or current_limit < min(limit, pv + step))
+    return False
+
+
 def autorepeat_function_powercontrolmode8_recompute(initval: int, descr: Any, datadict: dict[str, Any]) -> dict[str, Any]:
     # initval = BUTTONREPEAT_FIRST means first run;
     # initval = BUTTONREPEAT_LOOP means subsequent runs for button autorepeat value functions
@@ -967,7 +986,7 @@ def autorepeat_function_powercontrolmode8_recompute(initval: int, descr: Any, da
         measured_power = datadict.get("measured_power", None)
         _LOGGER.debug("[Mode8 Negative Injection] probes: measured_power=%sW", measured_power if measured_power is not None else "n/a")
 
-        if pv >= hl or cur_pvlimit < min(setpvlimit, pv_threshold):
+        if _mode8_charge_path(datadict, pv, houseload, houseload_alt):
             # Surplus or limited pv path: battery is requested to charge at up to the rate
             # limit from PV alone then use measured export as the control signal to adjust PV limit.
             # Below target: PV should be reduced to prevent export.
@@ -1115,7 +1134,7 @@ def autorepeat_function_powercontrolmode8_recompute(initval: int, descr: Any, da
         )
 
         # Surplus path: charge battery (within BMS and user cap), exporting any excess.
-        if pv >= houseload:
+        if _mode8_charge_path(datadict, pv, houseload, houseload_alt):
             surplus = pv - houseload
 
             # Battery gets surplus PV up to BMS limit
@@ -1208,7 +1227,7 @@ def autorepeat_function_powercontrolmode8_recompute(initval: int, descr: Any, da
             grid_export if grid_export is not None else "n/a",
         )
 
-        if pv >= hl:
+        if _mode8_charge_path(datadict, pv, houseload, houseload_alt):
             # Surplus path: use measured export as the control signal.
             # Below target: battery should not charge and may need to back off existing charge.
             # At/above target: battery can absorb the excess in bounded steps.
@@ -1596,6 +1615,59 @@ def bms_2_charge_dependencies(data: dict[str, Any], active: set[str]) -> tuple[s
     return bms_charge_dependencies(data, active, 2)
 
 
+def remotecontrol_dependencies(data: dict[str, Any], active: set[str]) -> set[str]:
+    """Measured sources and installed protection settings for modes 1-7."""
+    if data.get("remotecontrol_power_control", "Disabled") == "Disabled":
+        return set()
+    required = {"battery_capacity", "measured_power"}
+    required.update(active.intersection({"parallel_setting", "selfuse_discharge_min_soc", "export_control_user_limit"}))
+    if data.get("parallel_setting", "Free") == "Master":
+        required.update({"pm_total_pv_power", "pm_total_inverter_power", "pm_battery_power_charge", "pm_total_house_load"})
+    elif data.get("parallel_setting", "Free") != "Slave":
+        required.update({"pv_power_total", "inverter_power", "battery_power_charge"}.intersection(active))
+    required.update(active.intersection({f"{prefix}_l{phase}" for prefix in ("measured_power", "grid_voltage") for phase in (1, 2, 3)}))
+    return required
+
+
+def mode8_dependencies(data: dict[str, Any], active: set[str]) -> set[str]:
+    """Select charge-limit inputs only on paths that request battery charging."""
+    mode = data.get("remotecontrol_power_control_mode", "Disabled")
+    if mode == "Disabled" or data.get("parallel_setting", "Free") != "Free":
+        return set()
+    required = {"battery_capacity", "measured_power", "inverter_power"}
+    required.update(
+        active.intersection(
+            {
+                "pv_power_total",
+                "meter_2_measured_power",
+                "parallel_setting",
+                "selfuse_discharge_min_soc",
+            }
+        )
+    )
+    if mode in ("Negative Injection Price", "Negative Injection and Consumption Price", "Export-First Battery Limit"):
+        required.update(active.intersection({"battery_power_charge"}))
+    if _mode8_charge_path(
+        data,
+        data.get("pv_power_total", 0),
+        value_function_house_load(0, None, data),
+        value_function_house_load_alt(0, None, data),
+    ):
+        required.update(active.intersection({"battery_charge_upper_soc"}))
+        if mode in ("Export-First Battery Limit", "Enabled No Discharge"):
+            required.update(active.intersection({"export_control_user_limit"}))
+        if mode == "Export-First Battery Limit":
+            required.update(active.intersection({"inverter_power_type"}))
+        if _positive_input(data, "battery_max_charge_power"):
+            required.add("battery_max_charge_power")
+        else:
+            bms = active.intersection({"bms_max_charge", "bms_2_max_charge"})
+            required.update(bms or {"battery_charge_max_current"})
+            if bms and all(data.get(key) is not None for key in bms) and sum(data[key] for key in bms) <= 0:
+                required.add("battery_charge_max_current")
+    return required
+
+
 def value_function_battery_capacity_gen5(initval: int, descr: Any, datadict: dict[str, Any]) -> int | None:
     # This will attempt to select between multiple sensors based on which have a
     # value. This assumes that real batteries will never report a value of 0% SoC,
@@ -1800,6 +1872,8 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         icon="mdi:battery-clock",
         value_function=autorepeat_function_remotecontrol_recompute,
         autorepeat="remotecontrol_autorepeat_duration",
+        autorepeat_dependencies=remotecontrol_dependencies,
+        autorepeat_cadence=("measured_power", "pv_power_total", "inverter_power", "pm_total_inverter_power"),
     ),
     SolaxModbusButtonEntityDescription(
         name="PowerControlMode Trigger (mode 8/9)",
@@ -1810,6 +1884,8 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         icon="mdi:battery-clock",
         value_function=autorepeat_function_powercontrolmode8_recompute,
         autorepeat="remotecontrol_autorepeat_duration",
+        autorepeat_dependencies=mode8_dependencies,
+        autorepeat_cadence=("measured_power", "pv_power_total", "inverter_power", "battery_power_charge"),
     ),
     SolaxModbusButtonEntityDescription(
         name="System On",
