@@ -1,4 +1,5 @@
 import logging
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from time import time
@@ -1559,6 +1560,101 @@ def value_function_pm_total_pv_current(initval: int, descr: Any, datadict: dict[
     return int(pv_current_1 + pv_current_2)
 
 
+def _positive_input(data: dict[str, Any], key: str) -> bool:
+    value = data.get(key)
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
+
+
+def battery_capacity_dependencies(data: dict[str, Any], active: set[str]) -> tuple[set[str], set[str]]:
+    """Use the total SoC alone, otherwise require every configured battery."""
+    if _positive_input(data, "battery_total_capacity_charge"):
+        return {"battery_total_capacity_charge"}, set()
+    required = active.intersection({"battery_1_capacity_charge", "battery_2_capacity_charge"})
+    if not required:
+        required = {"battery_total_capacity_charge"}
+    capacities = {"bms_battery_capacity", "bms_2_battery_capacity"}
+    optional = capacities if len(required) == 2 and all(_positive_input(data, key) for key in capacities | required) else set()
+    return required, optional
+
+
+def bms_charge_dependencies(data: dict[str, Any], active: set[str], battery: int = 1) -> tuple[set[str], set[str]]:
+    """Select the voltage/current actually used, including fallback splitting."""
+    voltages = ("battery_voltage_charge", "battery_1_voltage_charge") if battery == 1 else ("battery_2_voltage_charge",)
+    voltage = next((key for key in voltages if _positive_input(data, key)), next((key for key in voltages if key in active), voltages[0]))
+    current = "bms_charge_max_current" if battery == 1 else "bms_2_charge_max_current"
+    required = {voltage}
+    if data.get(current) is not None:
+        required.add(current)
+    else:
+        required.add("battery_charge_max_current")
+        other = ("battery_2_voltage_charge",) if battery == 1 else ("battery_voltage_charge", "battery_1_voltage_charge")
+        required.update(key for key in other if key in active)
+    return required, set()
+
+
+def bms_2_charge_dependencies(data: dict[str, Any], active: set[str]) -> tuple[set[str], set[str]]:
+    return bms_charge_dependencies(data, active, 2)
+
+
+def remotecontrol_dependencies(data: dict[str, Any], active: set[str]) -> set[str]:
+    """Measured sources and installed protection settings for modes 1-7."""
+    if data.get("remotecontrol_power_control", "Disabled") == "Disabled":
+        return set()
+    required = {"battery_capacity", "measured_power"}
+    required.update(active.intersection({"parallel_setting", "selfuse_discharge_min_soc", "export_control_user_limit"}))
+    if data.get("parallel_setting", "Free") == "Master":
+        required.update({"pm_total_pv_power", "pm_total_inverter_power", "pm_battery_power_charge", "pm_total_house_load"})
+    elif data.get("parallel_setting", "Free") != "Slave":
+        required.update({"pv_power_total", "inverter_power", "battery_power_charge"}.intersection(active))
+    required.update(active.intersection({f"{prefix}_l{phase}" for prefix in ("measured_power", "grid_voltage") for phase in (1, 2, 3)}))
+    return required
+
+
+def mode8_dependencies(data: dict[str, Any], active: set[str]) -> set[str]:
+    """Select charge-limit inputs only on paths that request battery charging."""
+    mode = data.get("remotecontrol_power_control_mode", "Disabled")
+    if mode == "Disabled" or data.get("parallel_setting", "Free") != "Free":
+        return set()
+    required = {"battery_capacity", "measured_power", "inverter_power"}
+    required.update(
+        active.intersection(
+            {
+                "pv_power_total",
+                "meter_2_measured_power",
+                "parallel_setting",
+                "selfuse_discharge_min_soc",
+            }
+        )
+    )
+    if mode in ("Negative Injection Price", "Negative Injection and Consumption Price", "Export-First Battery Limit"):
+        required.update(active.intersection({"battery_power_charge"}))
+    pv = data.get("pv_power_total", 0) or 0
+    hl = max(0, pv - (data.get("battery_power_charge", 0) or 0) - (data.get("measured_power", 0) or 0) + (data.get("meter_2_measured_power", 0) or 0))
+    charges = mode == "Negative Injection and Consumption Price"
+    if mode == "Export-First Battery Limit":
+        charges = pv >= hl
+    elif mode == "Enabled No Discharge":
+        charges = pv >= (data.get("inverter_power", 0) or 0) - (data.get("measured_power", 0) or 0) + (data.get("meter_2_measured_power", 0) or 0)
+    elif mode == "Negative Injection Price":
+        current_limit = data.get("remotecontrol_current_pv_power_limit")
+        limit = data.get("remotecontrol_pv_power_limit", 10000)
+        charges = pv >= hl or (current_limit is not None and current_limit < min(limit, pv + data.get("pv_unlimited_delta_w", 1000)))
+    if charges:
+        required.update(active.intersection({"battery_charge_upper_soc"}))
+        if mode in ("Export-First Battery Limit", "Enabled No Discharge"):
+            required.update(active.intersection({"export_control_user_limit"}))
+        if mode == "Export-First Battery Limit":
+            required.update(active.intersection({"inverter_power_type"}))
+        if _positive_input(data, "battery_max_charge_power"):
+            required.add("battery_max_charge_power")
+        else:
+            bms = active.intersection({"bms_max_charge", "bms_2_max_charge"})
+            required.update(bms or {"battery_charge_max_current"})
+            if bms and all(data.get(key) is not None for key in bms) and sum(data[key] for key in bms) <= 0:
+                required.add("battery_charge_max_current")
+    return required
+
+
 def value_function_battery_capacity_gen5(initval: int, descr: Any, datadict: dict[str, Any]) -> int | None:
     # This will attempt to select between multiple sensors based on which have a
     # value. This assumes that real batteries will never report a value of 0% SoC,
@@ -1763,6 +1859,8 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         icon="mdi:battery-clock",
         value_function=autorepeat_function_remotecontrol_recompute,
         autorepeat="remotecontrol_autorepeat_duration",
+        autorepeat_dependencies=remotecontrol_dependencies,
+        autorepeat_cadence=("measured_power", "pv_power_total", "inverter_power", "pm_total_inverter_power"),
     ),
     SolaxModbusButtonEntityDescription(
         name="PowerControlMode Trigger (mode 8/9)",
@@ -1773,6 +1871,8 @@ BUTTON_TYPES: Sequence["SolaxModbusButtonEntityDescription"] = [
         icon="mdi:battery-clock",
         value_function=autorepeat_function_powercontrolmode8_recompute,
         autorepeat="remotecontrol_autorepeat_duration",
+        autorepeat_dependencies=mode8_dependencies,
+        autorepeat_cadence=("measured_power", "pv_power_total", "inverter_power", "battery_power_charge"),
     ),
     SolaxModbusButtonEntityDescription(
         name="System On",
@@ -6668,6 +6768,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         device_class=SensorDeviceClass.BATTERY,
         state_class=SensorStateClass.MEASUREMENT,
         value_function=value_function_battery_capacity_gen5,
+        dependency_selector=battery_capacity_dependencies,
         depends_on=["battery_total_capacity_charge", "battery_1_capacity_charge", "battery_2_capacity_charge"],
         optional_depends_on=["bms_battery_capacity", "bms_2_battery_capacity"],
         modbus_max=99,
@@ -8060,6 +8161,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery Max Charge Rate",
         key="bms_max_charge",
         value_function=value_function_bms_max_charge,
+        dependency_selector=bms_charge_dependencies,
         depends_on=["battery_voltage_charge", "battery_1_voltage_charge", "battery_2_voltage_charge"],
         depends_on_any=[
             ("battery_voltage_charge", "battery_1_voltage_charge"),
@@ -8076,6 +8178,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery 1 Max Charge Rate",
         key="bms_max_charge",
         value_function=value_function_bms_max_charge,
+        dependency_selector=bms_charge_dependencies,
         depends_on=["battery_voltage_charge", "battery_1_voltage_charge", "battery_2_voltage_charge"],
         depends_on_any=[
             ("battery_voltage_charge", "battery_1_voltage_charge"),
@@ -8092,6 +8195,7 @@ SENSOR_TYPES_MAIN: list[SolaXModbusSensorEntityDescription] = [
         name="Battery 2 Max Charge Rate",
         key="bms_2_max_charge",
         value_function=value_function_bms_2_max_charge,
+        dependency_selector=bms_2_charge_dependencies,
         depends_on=["battery_2_voltage_charge", "battery_voltage_charge", "battery_1_voltage_charge"],
         depends_on_any=[("bms_2_charge_max_current", "battery_charge_max_current")],
         native_unit_of_measurement=UnitOfPower.WATT,

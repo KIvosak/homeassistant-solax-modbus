@@ -138,7 +138,8 @@ async def test_fast_refresh_interleaves_between_slow_device_groups() -> None:
     await asyncio.sleep(0)  # Queue fast while the first slow group owns the lock.
     release.set()
     await asyncio.gather(slow_task, fast_task)
-    assert published == [191, 191, 191]
+    # Publish once per completed interval rather than once per device group.
+    assert published == [191, 191]
 
 
 @pytest.mark.asyncio
@@ -269,11 +270,11 @@ async def test_identical_power_is_a_new_observation_but_topology_is_not(monkeypa
     clock[0] += 2
     await hub._refresh_interval_group_once(settings)
     assert hub._accepted_input_sample("house_load") == first
-    assert hub._input_observations()[ed.key][0] == first[0]
+    assert hub._input_observations()[ed.key].timestamp == first.timestamp
     clock[0] += 2
     await hub._refresh_interval_group_once(power)
-    assert hub._accepted_input_sample("house_load")[0] == clock[0]
-    assert hub._accepted_input_sample("house_load")[2] == clock[0] + 15
+    assert hub._accepted_input_sample("house_load").timestamp == clock[0]
+    assert hub._accepted_input_sample("house_load").deadline == clock[0] + 15
     assert hub.data[ed.key] == 191
 
 

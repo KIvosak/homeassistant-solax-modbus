@@ -57,6 +57,12 @@ The available fields are:
   applicable optional input must be fresh to trigger recalculation.
 - `readiness_validator`: optional domain-specific validation after the generic
   checks. It receives the source data dictionary and must return a boolean.
+- `dependency_selector`: optional selection of `(required, optional)` key sets
+  from the filtered input dictionary and applicable keys. Static declarations
+  still list every possible input for ordering and polling. A selected branch
+  replaces the static required/alternative gate, and unused inputs are removed
+  before the value function runs. The accepted computation records the inputs
+  it used, including optional inputs, for subsequent invalidation and expiry.
 - `recompute_each_poll`: use only for time-dependent calculations or values
   maintained by local control code, whose result can change without a Modbus
   dependency becoming fresh.
@@ -146,6 +152,90 @@ downtime, and the existing local-midnight reset remains in effect.
 The accumulator and extra restore data keep the unrounded total. Published
 energy uses three decimal places, including the restored-value fallback before
 the first accepted power sample. Publication never rounds the stored total.
+
+## Observation identity and final publication
+
+`InputObservation` is an immutable sample containing its measurement timestamp,
+value, absolute deadline and references to the inputs used in its calculation.
+Each input reference identifies its hub, key and observation. Every raw read
+creates a distinct object, including a read with the same numeric value and
+timestamp. Equality is by identity, so neither numeric equality nor clock
+resolution can collapse a real measurement into a repeated publication.
+
+The observations alone carry freshness, selected dependencies and deduplication
+state; there are no separate generation/signature/dependency registries to
+commit. A group's observations are staged together until validation accepts
+them. A rejected group publishes none of them and invalidates its attempted
+inputs. Rebuild clears observations and cached controller payloads, so retained
+numbers cannot authorize a new calculation.
+
+A computed sensor is evaluated again when its selected input observations
+change. Reusing the same input objects performs no duplicate calculation.
+Time-dependent/local descriptions retain `recompute_each_poll`.
+Internal computations remain available before `readFollowUp`, and a new input
+in another device group can require another internal computation. Final
+computed callbacks run once per key at the end of the interval refresh, after
+accepted group commits. ED also deduplicates unchanged selected source
+observations, including each contributing hub and topology. Riemann callbacks
+continue to consume the completed source snapshot, including invalid outcomes.
+
+## SolaX VPP lifecycle and cadence
+
+Autorepeat runs after the interval's device groups, rather than once per device
+group. The two SolaX control buttons declare `autorepeat_dependencies` and
+`autorepeat_cadence`. The cadence owner is the shortest configured raw polling
+interval reachable through the mode's required power keys in the cadence
+declaration. Settings, topology and BMS limits are validity dependencies, not
+independent clock owners. For power at 5 s and settings at 15 s the owner is
+5 s; for 6/15 it is 6 s. No fixed interval or additional global throttle is
+applied. Other plugins retain one autorepeat call per interval refresh.
+
+`FIRST` uses the same accepted-input gate as `LOOP`. A control computation
+advances the filters once on the owner's completed poll when a required input
+observation or local control request changed. A slower poll may update inputs,
+but those changes are consumed at the next owner poll. Explicit disable and
+unsupported Mode 8 topology are processed without waiting for new power data.
+Local filter outputs are state, so publication cannot replace them with an
+older observed value or make them look like new control requests.
+
+On an owner poll with no new relevant observation/request, the last validated
+payload is sent as a keepalive, without invoking the controller or advancing
+its filters. The configured command duration, device timeout and timeout
+action remain in the payload. A keepalive does not renew input leases. Timer
+expiry calls `POST` once; skipped/failed polls still maintain expiry and input
+validity. A failed cleanup write remains pending and is retried on subsequent
+polls until the transport confirms the write, without rerunning the filter.
+Transport acknowledgement is not a physical readback of the resulting mode.
+
+Input selection, validity and cadence are checked once in
+`compute_autorepeat_payload`, shared by FIRST and LOOP. The interval runner
+handles lifecycle and transport; it does not prepare the same inputs again.
+
+VPP consumes accepted, unexpired observations rather than HA entity
+availability or retained numbers in `hub.data`. Numeric power/control inputs
+and their computed leaves must be finite numbers; booleans and numeric strings
+are rejected. Zero is a valid measurement. Installed number/select readbacks
+participate in this gate; local requests remain separate. The shared cache is
+not globally cleared.
+
+Gen5 total SoC is authoritative when valid and positive; unused per-battery
+fallbacks and capacity metadata cannot block it or shorten its deadline. A
+fallback requires every applicable battery SoC. Two valid positive capacities
+permit weighting; incomplete capacity metadata uses the conservative minimum.
+BMS power selects the voltage/current actually used, requiring the other
+battery's voltage when splitting a shared-current fallback. Control charge
+limits are required on charging branches; invalid installed individual limits
+cannot produce a partial BMS sum. A valid total charge limit can replace those
+individual estimates. Phase sums keep all applicable phases mandatory.
+
+On a missing, invalid, failed, discarded or expired required control input,
+the loop is stopped and its existing `POST` disable payload is written
+immediately, including on a slower or skipped poll. Mode 8 also clears its
+local current setpoints to `None`, preserving their legitimate inactive
+publication. An unconfirmed disable remains pending; the device's configured
+timeout is the fallback if communication is unavailable. Regulation requires
+a new trigger after valid accepted inputs return. No zero measurement is
+invented, and a healthy bounded reuse does not reset filters.
 
 ## Contributor checks
 

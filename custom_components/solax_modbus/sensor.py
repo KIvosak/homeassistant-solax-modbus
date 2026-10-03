@@ -758,7 +758,7 @@ class RiemannSumEnergySensor(SolaXModbusSensor, RestoreEntity):
             return
         max_age = data_hub.computed_sensor_max_age(SimpleNamespace(key=None, depends_on=[source_key]))
         observation = data_hub._accepted_input_sample(source_key, include_pending=False)
-        deadline = observation[2] if observation is not None else current_time + max_age
+        deadline = observation.deadline if observation is not None else current_time + max_age
         if (
             self._last_source_hub is not data_hub
             or self._last_source_key != source_key

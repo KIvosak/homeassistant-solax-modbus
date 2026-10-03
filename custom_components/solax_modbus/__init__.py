@@ -599,6 +599,16 @@ class RegisterEncodingError(HomeAssistantError):
     """Raised when a value cannot be represented by its Modbus register type."""
 
 
+@dataclass(frozen=True, eq=False)
+class InputObservation:
+    """One read or calculation; equal values still identify distinct samples."""
+
+    timestamp: float
+    value: Any
+    deadline: float
+    inputs: tuple[tuple["SolaXModbusHub", str, "InputObservation"], ...] = ()
+
+
 class SolaXModbusHub:
     """Thread safe wrapper class for pymodbus."""
 
@@ -1292,6 +1302,7 @@ class SolaXModbusHub:
         if self.blocks_changed:
             self.rebuild_blocks(self.initial_groups)
         if not bypass_slowdown and (self.cyclecount % self.slowdown) != 0:
+            self._publish_computed_sensors(await self._async_run_autorepeats(None))
             return PollOutcome.SKIPPED, 0
 
         outcomes: list[PollOutcome] = []
@@ -1299,9 +1310,12 @@ class SolaXModbusHub:
         # Dependencies may span device groups (e.g. inverter settings and PM data).
         # Keep freshness local to this interval refresh, never to the hub or device.
         cycle_fresh_keys: set[str] = set()
+        cycle_computed_keys: set[str] = set()
         for group in list(interval_group.device_groups.values()):
             group.computed_interval = getattr(interval_group, "interval", None)
+            group.defer_computed_updates = True
             group_outcome = await self.async_read_modbus_data(group, cycle_fresh_keys)
+            cycle_computed_keys.update(getattr(group, "computed_fresh_keys", set()))
             outcomes.append(group_outcome)
             if group_outcome.communication_succeeded and getattr(group, "publish_updates", True):
                 for sensor in group.sensors:
@@ -1318,6 +1332,9 @@ class SolaXModbusHub:
                 if getattr(self, "gatedEntities", None):
                     await self.async_refresh_gated_entities()
             _LOGGER.debug("%s: device group read done with outcome=%s", self._name, group_outcome.value)
+
+        cycle_computed_keys.update(await self._async_run_autorepeats(getattr(interval_group, "interval", None)))
+        self._publish_computed_sensors(cycle_computed_keys)
 
         # Cross-hub consumers use a completed, accepted interval snapshot, never
         # another hub's matching key names or an unvalidated in-flight read.
@@ -2139,13 +2156,17 @@ class SolaXModbusHub:
             return False, set(), (), set()
 
         required = self._active_dependency_keys(declared_required, data, descriptions)
+        selector = getattr(descr, "dependency_selector", None)
+        selected_optional: set[str] | None = None
+        if selector is not None:
+            required, selected_optional = selector(data, set(descriptions) | set(data))
         if self._dependency_values(declared_required) and not required:
             return False, set(), (), set()
         if any(not self._computed_input_available(data, dependency) for dependency in required):
             return False, required, (), set()
 
         alternative_groups: list[set[str]] = []
-        for alternatives in getattr(descr, "depends_on_any", None) or []:
+        for alternatives in (getattr(descr, "depends_on_any", None) or []) if selector is None else []:
             active_alternatives = self._active_dependency_keys(alternatives, data, descriptions)
             available_alternatives = {dependency for dependency in active_alternatives if self._computed_input_available(data, dependency)}
             if not available_alternatives:
@@ -2153,6 +2174,8 @@ class SolaXModbusHub:
             alternative_groups.append(available_alternatives)
 
         optional = self._active_dependency_keys(getattr(descr, "optional_depends_on", None), data, descriptions)
+        if selected_optional is not None:
+            optional = selected_optional
 
         validator = getattr(descr, "readiness_validator", None)
         if validator is not None:
@@ -2193,9 +2216,17 @@ class SolaXModbusHub:
             ):
                 source_data.pop(key, None)
         ready, required, alternative_groups, optional = self._computed_sensor_ready(descr, source_data, descriptions)
+        used = required | optional.intersection(accepted)
+        for alternatives in alternative_groups:
+            used.update(alternatives.intersection(accepted))
+        inputs = self._observed_inputs(used)
         if not ready:
-            self._remember_computed_sample(descr, None, source_data, accepted)
+            self._remember_computed_sample(descr, None, inputs)
             return False
+
+        if getattr(descr, "dependency_selector", None) is not None:
+            for key in dependencies - required - optional:
+                source_data.pop(key, None)
 
         if not force and not getattr(descr, "recompute_each_poll", False):
             current_fresh_keys = accepted
@@ -2208,64 +2239,73 @@ class SolaXModbusHub:
             if not required and not alternative_groups and optional and not optional.intersection(current_fresh_keys):
                 return False
 
+        previous = self._accepted_input_sample(descr.key)
+        if not force and not getattr(descr, "recompute_each_poll", False):
+            if previous is not None and previous.inputs == inputs:
+                return False
+
         try:
             value = descr.value_function(0, descr, source_data)
         except Exception as ex:
             _LOGGER.debug("%s: cannot compute value for %s: %s", self._name, descr.key, ex)
-            self._remember_computed_sample(descr, None, source_data, accepted)
+            self._remember_computed_sample(descr, None, inputs)
             return False
 
         if (value is None and not getattr(descr, "allow_none", False)) or (isinstance(value, float) and not math.isfinite(value)):
             _LOGGER.debug("%s: refusing invalid computed value for %s", self._name, descr.key)
-            self._remember_computed_sample(descr, None, source_data, accepted)
+            self._remember_computed_sample(descr, None, inputs)
             return False
         data[descr.key] = value
-        self._remember_computed_sample(descr, value, source_data, accepted)
+        self._remember_computed_sample(descr, value, inputs)
         return True
 
-    def _input_observations(self, *, include_pending: bool = True) -> dict[str, tuple[float, Any, float]]:
+    def _input_observations(self, *, include_pending: bool = True) -> dict[str, InputObservation]:
         """Use staged group observations until its validation has completed."""
         pending = getattr(self, "_pending_input_observations", None)
         return pending if include_pending and pending is not None else getattr(self, "_computed_input_observations", {})
 
     def _accepted_input_sample(
-        self, key: str, seen: frozenset[str] = frozenset(), *, include_pending: bool = True
-    ) -> tuple[float, Any, float] | None:
+        self, key: str, seen: frozenset[tuple[int, str]] = frozenset(), *, include_pending: bool = True
+    ) -> InputObservation | None:
         """Bound each input by its own lease and reject failed computed dependencies."""
         sample = self._input_observations(include_pending=include_pending).get(key)
-        if sample is None or key in seen or _mtime.monotonic() >= sample[2] or not self._computed_input_available({key: sample[1]}, key):
+        identity = (id(self), key)
+        if (
+            sample is None
+            or identity in seen
+            or _mtime.monotonic() >= sample.deadline
+            or not self._computed_input_available({key: sample.value}, key)
+        ):
             return None
-        descr = self.sensorDescriptions.get(key)
-        if descr is not None and getattr(descr, "register", -1) < 0:
-            required = self._active_dependency_keys(getattr(descr, "depends_on", None), self.data, self.sensorDescriptions)
-            if any(self._accepted_input_sample(dep, seen | {key}, include_pending=include_pending) is None for dep in required):
+        for hub, dependency, _source in sample.inputs:
+            if hub._accepted_input_sample(dependency, seen | {identity}, include_pending=include_pending and hub is self) is None:
                 return None
-            for alternatives in getattr(descr, "depends_on_any", None) or []:
-                if not any(self._accepted_input_sample(dep, seen | {key}, include_pending=include_pending) is not None for dep in alternatives):
-                    return None
         return sample
 
-    def _remember_computed_sample(self, descr: Any, value: Any, data: dict[str, Any], accepted: set[str]) -> None:
+    def _observed_inputs(self, keys: set[str], *, include_pending: bool = True) -> tuple[tuple["SolaXModbusHub", str, InputObservation], ...]:
+        """Keep source references for both dependency validation and deduplication."""
+        return tuple(
+            (self, key, sample) for key in sorted(keys) if (sample := self._accepted_input_sample(key, include_pending=include_pending)) is not None
+        )
+
+    def _remember_computed_sample(self, descr: Any, value: Any, inputs: tuple[tuple["SolaXModbusHub", str, InputObservation], ...]) -> None:
         """A computation inherits input deadlines, rather than renewing old inputs."""
         observations = getattr(self, "_pending_input_observations", None)
         if observations is None:
             return
-        _ready, required, alternatives, optional = self._computed_sensor_ready(descr, data, self.sensorDescriptions)
-        keys = required | optional.intersection(accepted)
-        for group in alternatives:
-            keys.update(group.intersection(accepted))
-        samples = [sample for key in keys if (sample := self._accepted_input_sample(key)) is not None]
+        samples = [sample for _hub, _key, sample in inputs]
         now = _mtime.monotonic()
-        observations[descr.key] = (
-            max((sample[0] for sample in samples), default=now),
+        observations[descr.key] = InputObservation(
+            max((sample.timestamp for sample in samples), default=now),
             value,
-            min(sample[2] for sample in samples) if samples else now + self.computed_sensor_max_age(descr),
+            min(sample.deadline for sample in samples) if samples else now + self.computed_sensor_max_age(descr),
+            inputs,
         )
 
     def computed_sensor_remaining_age(self, descr: Any) -> float:
         """Expire the publication at the accepted inputs' absolute deadline."""
         sample = self._input_observations().get(descr.key)
-        return max(0.0, sample[2] - _mtime.monotonic()) if sample is not None else self.computed_sensor_max_age(descr)
+        return max(0.0, sample.deadline - _mtime.monotonic()) if sample is not None else self.computed_sensor_max_age(descr)
 
     def _computed_inputs(
         self, data: dict[str, Any], fresh_keys: set[str], dependencies: set[str], interval: float | None
@@ -2280,7 +2320,7 @@ class SolaXModbusHub:
                     accepted.discard(key)
                     source_data[key] = None
                 else:
-                    source_data[key] = sample[1]
+                    source_data[key] = sample.value
                     accepted.add(key)
             for key in dependencies - accepted:
                 if key in observations:
@@ -2353,13 +2393,13 @@ class SolaXModbusHub:
                 topology = self._accepted_input_sample("parallel_setting", include_pending=bool(data))
                 if topology is None:
                     return None
-                snapshot["parallel_setting"] = topology[1]
+                snapshot["parallel_setting"] = topology.value
             source_key = mapping.get_source_key(snapshot)
             sample = self._accepted_input_sample(source_key, include_pending=bool(data))
             if sample is None:
                 return None
-            snapshot[source_key] = sample[1]
-            return sample[0], snapshot
+            snapshot[source_key] = sample.value
+            return sample.timestamp, snapshot
         if not data:
             candidates.extend(sorted(getattr(self, "_computed_source_snapshots", {}).items(), key=lambda sample: sample[1][0], reverse=True))
         dependencies = {mapping.source_key}
@@ -2385,7 +2425,7 @@ class SolaXModbusHub:
             if required.issubset(accepted) and all(self._computed_input_available(snapshot, key) for key in required):
                 if observations:
                     sample = self._accepted_input_sample(source_key, include_pending=bool(data))
-                    return (sample[0], snapshot) if sample is not None else None
+                    return (sample.timestamp, snapshot) if sample is not None else None
                 return timestamp, snapshot
             if require_source_sample:
                 return None
@@ -2396,8 +2436,8 @@ class SolaXModbusHub:
         mapping = descr._energy_dashboard_mapping
         hubs = getattr(descr, "_energy_dashboard_source_hubs", None) or (descr._energy_dashboard_source_hub or self,)
         sources = []
-        source_samples = []
-        source_deadlines = []
+        inputs = []
+        power_samples = []
         for hub in hubs:
             if hub is self and not hub._input_observations():
                 selected = mapping.get_source_key(data)
@@ -2419,16 +2459,22 @@ class SolaXModbusHub:
                 if observations is not None:
                     previous = observations.get(descr.key)
                     now = _mtime.monotonic()
-                    observations[descr.key] = (now, None, previous[2] if previous else now + self.computed_sensor_max_age(descr))
+                    observations[descr.key] = InputObservation(
+                        now, None, previous.deadline if previous else now + self.computed_sensor_max_age(descr)
+                    )
                 return True
             sources.append(snapshot)
-            sample = hub._accepted_input_sample(mapping.get_source_key(snapshot), include_pending=hub is self)
+            selected_key = mapping.get_source_key(snapshot)
+            sample = hub._accepted_input_sample(selected_key, include_pending=hub is self)
             if sample is not None:
-                source_samples.append(sample)
-                source_deadlines.append(sample[2])
+                inputs.append((hub, selected_key, sample))
+                power_samples.append(sample)
                 topology = hub._accepted_input_sample("parallel_setting", include_pending=hub is self) if mapping.source_key_pm else None
                 if topology is not None:
-                    source_deadlines.append(topology[2])
+                    inputs.append((hub, "parallel_setting", topology))
+        previous = self._accepted_input_sample(descr.key)
+        if previous is not None and previous.inputs == tuple(inputs):
+            return False
         source_data = sources[0].copy()
         source_data["_energy_dashboard_source_data"] = sources
         try:
@@ -2440,8 +2486,10 @@ class SolaXModbusHub:
             value = None
         data[descr.key] = value
         observations = getattr(self, "_pending_input_observations", None)
-        if observations is not None and source_samples:
-            observations[descr.key] = (max(sample[0] for sample in source_samples), value, min(source_deadlines))
+        if observations is not None and inputs:
+            observations[descr.key] = InputObservation(
+                max(sample.timestamp for sample in power_samples), value, min(sample.deadline for _hub, _key, sample in inputs), tuple(inputs)
+            )
         return True
 
     def _ordered_computed_sensors(self) -> list[tuple[str, Any]]:
@@ -2499,6 +2547,7 @@ class SolaXModbusHub:
 
     async def async_read_modbus_registers_all(self, group: Any, cycle_fresh_keys: set[str] | None = None) -> PollOutcome:
         group.publish_updates = False
+        group.computed_fresh_keys = set()
         if group.readPreparation is not None:
             if not await group.readPreparation(self.data):
                 _LOGGER.info("%s: device group read cancel", self._name)
@@ -2562,20 +2611,22 @@ class SolaXModbusHub:
         # Per-key observations distinguish an unrelated device group from a
         # failed read of this key, including groups sharing the same interval.
         attempted = set(fresh_keys)
+        attempted_descriptions: dict[str, Any] = {}
         for block in (*group.holdingBlocks, *group.inputBlocks):
             for description in getattr(block, "descriptions", {}).values():
                 descriptions = description.values() if isinstance(description, dict) else (description,)
                 attempted.update(descr.key for descr in descriptions)
+                attempted_descriptions.update({descr.key: descr for descr in descriptions})
         observations = getattr(self, "_computed_input_observations", {}).copy()
         now = _mtime.monotonic()
         for key in attempted:
-            descr = self.sensorDescriptions.get(key)
+            descr = self.sensorDescriptions.get(key) or attempted_descriptions.get(key)
             max_age = (
                 3 * float(self.scan_group(SimpleNamespace(entity_description=descr)))
                 if descr is not None and hasattr(self, "config")
                 else 3 * float(getattr(group, "computed_interval", None) or DEFAULT_SCAN_INTERVAL)
             )
-            observations[key] = (now, data.get(key) if key in fresh_keys else None, now + max_age)
+            observations[key] = InputObservation(now, data.get(key) if key in fresh_keys else None, now + max_age)
         self._pending_input_observations = observations
         if poll_outcome.communication_succeeded:
             # Use a copy: a rejected group must not contribute raw or computed
@@ -2587,7 +2638,7 @@ class SolaXModbusHub:
                 accepted_group = group.readFollowUp is None or await group.readFollowUp(previous_data, data)
             except Exception:
                 rejected = getattr(self, "_computed_input_observations", {}).copy()
-                rejected.update({key: (now, None, now) for key in attempted})
+                rejected.update({key: InputObservation(now, None, now) for key in attempted})
                 self._computed_input_observations = rejected
                 raise
             finally:
@@ -2595,7 +2646,7 @@ class SolaXModbusHub:
             if not accepted_group:
                 _LOGGER.warning("%s: device group validation failed; discarding this device group's snapshot", self._name)
                 rejected = getattr(self, "_computed_input_observations", {}).copy()
-                rejected.update({key: (now, None, now) for key in attempted})
+                rejected.update({key: InputObservation(now, None, now) for key in attempted})
                 self._computed_input_observations = rejected
                 return PollOutcome.DISCARDED
 
@@ -2608,6 +2659,9 @@ class SolaXModbusHub:
 
             for key, descr in list(self.computedSensors.items()):
                 if key not in computed_fresh_keys:
+                    continue
+                group.computed_fresh_keys.add(key)
+                if getattr(group, "defer_computed_updates", False):
                     continue
                 sens = self.sensorEntities.get(key)
                 _LOGGER.debug("%s: quickly updating state for computed sensor %s %s %s", self._name, sens, key, self.data.get(descr.key))
@@ -2638,46 +2692,164 @@ class SolaXModbusHub:
                 else:
                     self.writequeue.pop(queue_key, None)
 
-        # execute autorepeat entities (buttons and selects)
-        self.last_ts = _mtime.time()
-        for (
-            k,
-            v,
-        ) in list(self.data["_repeatUntil"].items()):  # use a list copy because dict may change during iteration
-            descr = self.computedEntities.get(k)
-            if descr and self.last_ts < v:
-                payload = descr.value_function(BUTTONREPEAT_LOOP, descr, self.data)  # initval = 1 means autorepeat run
-                if payload:
-                    reg = payload.get("register", descr.register)
-                    action = payload.get("action")
-                    if not action:
-                        _LOGGER.error("autorepeat value function for %s must return dict containing action", k)
-                    elif action == WRITE_MULTI_MODBUS:
-                        _LOGGER.debug("**debug** ready to repeat %s data: %s", k, payload)
-                        await self.async_write_registers_multi(
-                            unit=self._modbus_addr,
-                            address=reg,
-                            payload=payload.get("data"),
-                        )
-                    elif action == WRITE_SINGLE_MODBUS:
-                        _LOGGER.debug("Repeating %s register %s value %s", k, reg, payload.get("payload"))
-                        await self.async_write_register(unit=self._modbus_addr, address=reg, payload=payload.get("payload"))
-            elif descr:  # expired autorepeats
-                if self.data["_repeatUntil"][k] > 0:  # expired recently
-                    self.data["_repeatUntil"][k] = 0  # mark as finally expired, no further buttonrepeat post after this one
-                    _LOGGER.info("calling final value function POST for %s with initval %s", k, BUTTONREPEAT_POST)
-                    payload = descr.value_function(BUTTONREPEAT_POST, descr, self.data)  # None means no final call after expiration
-                    if payload:
-                        reg = payload.get("register", descr.register)
-                        action = payload.get("action")
-                        if action == WRITE_MULTI_MODBUS:
-                            _LOGGER.info("terminating loop %s - ready to send final payload data: %s", k, payload)
-                            await self.async_write_registers_multi(
-                                unit=self._modbus_addr,
-                                address=reg,
-                                payload=payload.get("data"),
-                            )
         return poll_outcome
+
+    def _publish_computed_sensors(self, keys: set[str]) -> None:
+        """Publish each final computed state once, including local cleanup outputs."""
+        for key in keys:
+            descr = self.computedSensors.get(key)
+            sensor = self.sensorEntities.get(key)
+            if sensor and descr and not descr.internal:
+                try:
+                    sensor.modbus_data_updated()
+                except Exception:
+                    _LOGGER.exception("%s: cannot publish computed sensor %s", self._name, key)
+
+    async def _async_run_autorepeats(self, interval: float | None) -> set[str]:
+        """Run lifecycle maintenance once per interval, with one measurement owner."""
+        local_outputs = ("remotecontrol_current_pushmode_power", "remotecontrol_current_pv_power_limit")
+        previous = {key: self.data.get(key) for key in local_outputs}
+        self.last_ts = _mtime.time()
+        pending_stops = getattr(self, "_autorepeat_pending_stops", {})
+        repeats = self.data["_repeatUntil"].copy()
+        for k in set(repeats) | set(pending_stops):
+            v = repeats.get(k, 0)
+            descr = self.computedEntities.get(k)
+            if descr is None:
+                continue
+            if k in pending_stops:
+                payload = pending_stops[k]
+            elif self.last_ts < v:
+                payload = self.compute_autorepeat_payload(BUTTONREPEAT_LOOP, descr, interval=interval)
+            elif v > 0:
+                self.data["_repeatUntil"][k] = 0
+                payload = self.compute_autorepeat_payload(BUTTONREPEAT_POST, descr)
+            else:
+                continue
+            if not payload:
+                continue
+            reg = payload.get("register", descr.register)
+            action = payload.get("action")
+            try:
+                if action == WRITE_MULTI_MODBUS:
+                    await self.async_write_registers_multi(unit=self._modbus_addr, address=reg, payload=payload.get("data"))
+                elif action == WRITE_SINGLE_MODBUS:
+                    await self.async_write_register(unit=self._modbus_addr, address=reg, payload=payload.get("payload"))
+                else:
+                    _LOGGER.error("autorepeat value function for %s must return a supported action", k)
+                    continue
+            except HomeAssistantError as ex:
+                # A stop remains pending until the transport acknowledges it.
+                _LOGGER.warning("%s: autorepeat write for %s is not confirmed: %s", self._name, k, ex)
+            else:
+                self.autorepeat_write_succeeded(k)
+        changed = {key for key in local_outputs if self.data.get(key) != previous[key] and key in self.computedSensors}
+        # These are local controller states, not new power measurements. Their
+        # explicit inactive None must publish even when the Modbus poll failed.
+        observations = getattr(self, "_computed_input_observations", {})
+        now = _mtime.monotonic()
+        for key in changed:
+            observations[key] = InputObservation(now, self.data.get(key), now + self.computed_sensor_max_age(self.computedSensors[key]))
+        self._computed_input_observations = observations
+        return changed
+
+    def autorepeat_write_succeeded(self, key: str) -> None:
+        """A confirmed write supersedes any pending cleanup for this controller."""
+        getattr(self, "_autorepeat_pending_stops", {}).pop(key, None)
+
+    def _autorepeat_input_data(self, active: set[str]) -> dict[str, Any]:
+        """Filter measured data without changing the shared cache or local controls."""
+        data = self.data.copy()
+        for key in active:
+            if key in getattr(self, "writeLocals", {}) or key.startswith("remotecontrol_current_"):
+                continue
+            sample = self._accepted_input_sample(key, include_pending=False)
+            if sample is None:
+                data.pop(key, None)
+            else:
+                data[key] = sample.value
+        return data
+
+    def _autorepeat_active_keys(self) -> set[str]:
+        """Include polled number/select readbacks, keeping local requests separate."""
+        keys = set(self.sensorDescriptions) | set(self._input_observations(include_pending=False))
+        for entities in (getattr(self, "numberEntities", {}), getattr(self, "selectEntities", {})):
+            keys.update(key for key, entity in entities.items() if getattr(entity.entity_description, "register", -1) >= 0)
+        return keys - set(getattr(self, "writeLocals", {}))
+
+    def _control_input_valid(self, key: str, seen: frozenset[tuple[int, str]] = frozenset()) -> bool:
+        """Also reject invalid numeric leaves hidden by a computed conversion."""
+        sample = self._accepted_input_sample(key, include_pending=False)
+        identity = (id(self), key)
+        if sample is None or identity in seen:
+            return False
+        value = sample.value
+        if key == "parallel_setting":
+            return value in ("Free", "Master", "Slave")
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+            return False
+        return all(hub._control_input_valid(source, seen | {identity}) for hub, source, _sample in sample.inputs)
+
+    def _autorepeat_interval(self, descr: Any, required: set[str]) -> float:
+        intervals = [
+            value
+            for key in descr.autorepeat_cadence
+            if key in self.sensorDescriptions and key in required
+            for value in self._computed_source_intervals(self.sensorDescriptions[key])
+        ]
+        return min(intervals) if intervals else float(getattr(self, "config", {}).get(CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL))
+
+    def compute_autorepeat_payload(self, phase: int, descr: Any, *, interval: float | None = None) -> Any:
+        """Validate before mutating filters; replay a keepalive without recomputing."""
+        if getattr(descr, "autorepeat_dependencies", None) is None:
+            return None if phase == BUTTONREPEAT_LOOP and interval is None else descr.value_function(phase, descr, self.data)
+        if phase == BUTTONREPEAT_POST:
+            getattr(self, "_autorepeat_payloads", {}).pop(descr.key, None)
+            payload = descr.value_function(phase, descr, self.data)
+            if payload:
+                pending = getattr(self, "_autorepeat_pending_stops", {})
+                pending[descr.key] = payload
+                self._autorepeat_pending_stops = pending
+            return payload
+        active = self._autorepeat_active_keys()
+        source = self._autorepeat_input_data(active)
+        try:
+            required = descr.autorepeat_dependencies(source, active)
+            ready = all(self._control_input_valid(key) for key in required)
+        except (TypeError, ValueError, OverflowError):
+            ready = False
+        if not ready:
+            self.data["_repeatUntil"][descr.key] = 0
+            _LOGGER.warning("%s: stopping %s because a required control input is invalid", self._name, descr.key)
+            return self.compute_autorepeat_payload(BUTTONREPEAT_POST, descr)
+        # Explicit disable and unsupported topology need no measurement owner.
+        if phase == BUTTONREPEAT_LOOP and required and (interval is None or interval != self._autorepeat_interval(descr, required)):
+            return None
+        # Controller outputs must not appear as new requests on the next poll.
+        local = {
+            key: value
+            for key, value in self.data.items()
+            if (key.startswith("remotecontrol_") or key in getattr(self, "writeLocals", {}))
+            and not key.startswith("remotecontrol_current_")
+            and key != "remotecontrol_autorepeat_remaining"
+        }
+        signature = (self._observed_inputs(required, include_pending=False), local)
+        cached = getattr(self, "_autorepeat_payloads", {})
+        previous = cached.get(descr.key)
+        if phase == BUTTONREPEAT_LOOP and previous is not None and previous[0] == signature:
+            return previous[1]
+        source["_repeatUntil"] = self.data["_repeatUntil"]
+        payload = descr.value_function(phase, descr, source)
+        for key in ("remotecontrol_current_pushmode_power", "remotecontrol_current_pv_power_limit"):
+            if key in source:
+                self.data[key] = source[key]
+        cached[descr.key] = (signature, payload)
+        self._autorepeat_payloads = cached
+        if self.data["_repeatUntil"].get(descr.key) == 0 and payload:
+            pending = getattr(self, "_autorepeat_pending_stops", {})
+            pending[descr.key] = payload
+            self._autorepeat_pending_stops = pending
+        return payload
 
     # --------------------------------------------- Check if sensor is a dependency -----------------------------------------------
 
@@ -2833,6 +3005,7 @@ class SolaXModbusHub:
     def rebuild_blocks(self, initial_groups: dict[Any, Any]) -> None:  # , computedRegs):
         self._computed_source_snapshots = {}
         self._computed_input_observations = {}
+        self._autorepeat_payloads = {}
         _LOGGER.debug("%s: rebuilding groups and blocks - pre: %s", self._name, initial_groups.keys())
         self.initial_groups = initial_groups
         for interval, interval_group in initial_groups.items():

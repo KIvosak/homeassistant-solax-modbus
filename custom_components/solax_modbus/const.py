@@ -289,6 +289,7 @@ class BaseModbusSensorEntityDescription(SensorEntityDescription):
     depends_on_any: list[tuple[str, ...]] | None = None
     optional_depends_on: list[str] | None = None
     readiness_validator: Callable[[dict[str, Any]], bool] | None = None
+    dependency_selector: Callable[[dict[str, Any], set[str]], tuple[set[str], set[str]]] | None = None
     recompute_each_poll: bool = False
     allow_none: bool = False  # Explicit unknown output, never a numeric zero.
     _energy_dashboard_device_info: Any = None  # DeviceInfo for energy dashboard
@@ -315,6 +316,8 @@ class BaseModbusButtonEntityDescription(ButtonEntityDescription):
     write_method: int = WRITE_SINGLE_MODBUS  # WRITE_SINGLE_MOBUS or WRITE_MULTI_MODBUS or WRITE_DATA_LOCAL
     value_function: Callable[[Any, Any, dict[str, Any]], Any] | None = None  #  value = function(initval, descr, datadict)
     autorepeat: str | None = None  # if not None: name of entity that contains autorepeat duration in seconds
+    autorepeat_dependencies: Callable[[dict[str, Any], set[str]], set[str]] | None = None
+    autorepeat_cadence: tuple[str, ...] = ()
     depends_on: list[str] | None = None  # list of modbus register keys that must be read
 
 
